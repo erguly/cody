@@ -1,0 +1,2161 @@
+import tkinter as tk
+from tkinter import ttk
+import pandas as pd
+import numpy as np
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
+import threading
+import time
+from datetime import datetime
+import ta
+import math
+from typing import List, Tuple, Dict, Any, Optional
+import logging
+from ta.utils import IndicatorMixin
+import csv
+import os
+import sqlite3 # SQLite için import
+import websocket # WebSocket istemcisi
+import json      # JSON işleme
+import ssl       # SSL ayarları
+import requests
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+
+import requests
+import time
+
+TELEGRAM_TOKEN = "***"
+CHAT_ID = "***"
+
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message}
+    requests.post(url, json=payload)
+
+def get_crypto_data():
+    # Your logic here
+    return "BTC: $50,000"
+
+while True:
+    data = get_crypto_data()
+    send_telegram_message(data)
+    time.sleep(120)  # 2 dakika bekle
+# Logging ayarları
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s') # INFO'ya geri dönüldü
+
+# PineScript'in nz() fonksiyonunu taklit etmek için yardımcı fonksiyon
+def nz(series, default=0.0):
+    return series.fillna(default)
+
+# PineScript'in ta.valuewhen() fonksiyonunu basitçe taklit (son değeri alır)
+# Not: Gerçek ta.valuewhen daha karmaşıktır, occurrence parametresi vardır.
+# Biz burada sadece son olayı alacağız.
+def valuewhen(condition, source, occurrence=0):
+    # condition True olduğunda source değerlerini al
+    valid_source = source[condition]
+    # Eğer hiç True yoksa veya occurrence index dışındaysa NaN döndür
+    if valid_source.empty or abs(occurrence) >= len(valid_source):
+        return np.nan
+    # İstenen olayı döndür (0 son olay, 1 bir önceki vb.)
+    return valid_source.iloc[-1 - occurrence]
+
+class CryptoScanner:
+    def __init__(self, api_key: str, api_secret: str):
+        # Increase default timeout for API requests
+        requests_params = {'timeout': 30} 
+        self.client = Client(api_key, api_secret, requests_params=requests_params)
+        self.symbols = self._get_symbols()
+        self.available_timeframes = ["1m", "3m", "5m", "15m"] # Kullanılabilir zaman dilimleri
+        # self.selected_timeframe = tk.StringVar(value=self.available_timeframes[0]) # Moved after root creation
+        self.period = 14
+        self.z_score_length = 14
+        self.rff = 0.02
+        self.use_zscore = True
+        
+        # Veri depolama
+        self.data: Dict[str, pd.DataFrame] = {}
+        self.scores: Dict[str, float] = {}
+        self.ratios: Dict[str, Dict[str, float]] = {}
+        self.signals: Dict[str, Dict[str, Any]] = {}
+        self.signal_history: Dict[str, List[Tuple[str, str]]] = {} 
+        
+        # --- Veritabanı ve Takip --- 
+        self.db_file = 'crypto_scanner.db' 
+        self.active_signals_to_track: Dict[str, Dict[str, Any]] = {} 
+        self._init_db() 
+        
+        # --- WebSocket Ayarları --- 
+        self.ws_endpoint = "wss://stream.binance.com:9443/ws/!kline@arr" 
+        self.ws: websocket.WebSocketApp = None
+        self.ws_thread: threading.Thread = None
+        self.initial_load_complete = threading.Event() 
+        self.stop_ws_flag = threading.Event() # WebSocket'i kontrollü durdurmak için
+        # --------------------------
+
+        # --- GUI (ÖNCE ROOT OLUŞTUR) ---
+        self.root = tk.Tk()
+        self.root.title("Crypto Scanner (WebSocket)")
+        self.selected_timeframe = tk.StringVar(value=self.available_timeframes[0]) # Seçili zaman dilimi (StringVar)
+        self.currently_requested_timeframe = self.available_timeframes[0] # Yüklenmesi istenen TF (String)
+        self.symbol_to_tree_item: Dict[str, str] = {} 
+        self.setup_gui()
+        # Seçilen zaman dilimi değiştiğinde _on_timeframe_selected çağır
+        self.selected_timeframe.trace('w', self._on_timeframe_selected_wrapper)
+        logging.info("CryptoScanner __init__ tamamlandı.") # LOG EKLE
+
+        # Add this near the end of the __init__ method
+        self.ml_model = None # Placeholder for the trained model/pipeline
+
+        # CryptoScanner sınıfının __init__ metodunun içine ekle
+        self.ML_CONFIDENCE_THRESHOLD = 0.6 # Başarı olasılığı en az %60 ise onayla
+        self.ml_predictions: Dict[str, str] = {} # ML tahmin sonucunu saklamak için (örn: "OK", "REJECTED")
+        # YENİ EKLENENLER:
+        self.VOLUME_CHANGE_PERC_THRESHOLD = 5.0  # Hacim en az %5 artmalı
+        self.CONFIRM_MOMENTUM_PERC_THRESHOLD = 0.0 # Teyit mumu momentumu pozitif olmalı (>0)
+
+    # --- Veritabanı Yardımcı Fonksiyonları --- 
+    def _connect_db(self):
+        """Veritabanına bağlantı oluşturur."""
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_file)
+            conn.row_factory = sqlite3.Row # Satırları dict gibi kullanmak için
+            return conn
+        except sqlite3.Error as e:
+            logging.error(f"SQLite bağlantı hatası: {e}")
+        return conn
+
+    def _init_db(self):
+        """Veritabanı tablolarını oluşturur (varsa es geçer)."""
+        conn = self._connect_db()
+        if conn is None:
+            return
+        try:
+            cursor = conn.cursor()
+            
+            # --- Eski 'status' sütununu 'tracking_status' olarak yeniden adlandırma (Mevcut DB için) ---
+            cursor.execute("PRAGMA table_info(signals)")
+            columns = [column[1] for column in cursor.fetchall()]
+            if 'status' in columns and 'tracking_status' not in columns:
+                logging.info("Eski 'status' sütunu bulundu, 'tracking_status' olarak yeniden adlandırılıyor...")
+                try:
+                    # Önce indeksleri kontrol et ve varsa sil (SQLite < 3.25 için gerekli olabilir)
+                    # cursor.execute("DROP INDEX IF EXISTS idx_signals_status") 
+                    cursor.execute("ALTER TABLE signals RENAME COLUMN status TO tracking_status")
+                    conn.commit()
+                    logging.info("'status' sütunu başarıyla 'tracking_status' olarak yeniden adlandırıldı.")
+                except sqlite3.Error as rename_error:
+                    logging.error(f"'status' sütununu yeniden adlandırırken SQLite hatası: {rename_error}")
+                    # Hata olursa devam etmeyi dene, belki tablo zaten doğru formattadır
+            # -------------------------------------------------------------------------------------
+            
+            # Sinyal tablosu (Genişletilmiş Sütunlarla)
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,            -- Sinyal onay zamanı
+                symbol TEXT NOT NULL,
+                signal_type TEXT NOT NULL,        -- C10L / C20L
+                score REAL,                       -- Sinyal anındaki skor
+                ratio REAL,                       -- Sinyal anındaki ratio (diff_percent)
+                signal_price REAL,                -- Teyit mumu kapanış fiyatı
+                signal_volume INTEGER,            -- Sinyal mumu (-2) hacmi
+                confirm_volume INTEGER,           -- Teyit mumu (-1) hacmi
+                signal_momentum_perc REAL,        -- Sinyal mumu % momentumu
+                confirm_momentum_perc REAL,       -- Teyit mumu % momentumu
+                signal_abs_price_change REAL,     -- Sinyal mumu mutlak fiyat değişimi
+                confirm_abs_price_change REAL,    -- Teyit mumu mutlak fiyat değişimi
+                volume_ok INTEGER,                -- confirm_volume >= signal_volume (0/1)
+                momentum_perc_ok INTEGER,         -- confirm_momentum_perc >= signal_momentum_perc (0/1)
+                momentum_abs_ok INTEGER,          -- confirm_abs_price_change >= signal_abs_price_change (0/1)
+                is_confirmed_orig INTEGER,        -- volume_ok AND momentum_perc_ok (0/1)
+                tracking_status TEXT DEFAULT 'TRACKING' -- TRACKING / COMPLETED / FAILED (isteğe bağlı)
+            )
+            """)
+            # Sonuç tablosu
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id INTEGER NOT NULL,
+                outcome_timestamp TEXT NOT NULL,
+                achieved_price REAL,
+                time_to_target_s REAL,
+                FOREIGN KEY (signal_id) REFERENCES signals (id)
+            )
+            """)
+            conn.commit()
+            logging.info(f"Veritabanı '{self.db_file}' başarıyla başlatıldı/kontrol edildi.")
+        except sqlite3.Error as e:
+            logging.error(f"SQLite tablo oluşturma hatası: {e}")
+        finally:
+            if conn:
+                conn.close()
+
+    def log_signal_to_db(self, symbol: str, signal_type: str, timestamp: datetime, details: dict) -> int | None:
+        """Onaylanmış sinyali genişletilmiş detaylarla veritabanına yazar ve ID'sini döndürür."""
+        # --- Timestamp Kontrolü Eklendi ---
+        if timestamp is None or not isinstance(timestamp, datetime):
+            logging.error(f"[{symbol}] log_signal_to_db fonksiyonuna geçersiz timestamp değeri geldi! Tip: {type(timestamp)}, Değer: {timestamp}")
+            return None
+        # ---------------------------------
+        conn = self._connect_db()
+        if conn is None: return None
+        # Sütun isimlerini açıkça belirtmek daha güvenli
+        sql = ''' INSERT INTO signals(
+                    timestamp, symbol, signal_type, score, ratio, signal_price, 
+                    signal_volume, confirm_volume, 
+                    signal_momentum_perc, confirm_momentum_perc, 
+                    signal_abs_price_change, confirm_abs_price_change,
+                    volume_ok, momentum_perc_ok, momentum_abs_ok, is_confirmed_orig,
+                    tracking_status
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) '''
+        try:
+            cursor = conn.cursor()
+            conf = details.get('confirmation', {}) # Kısaltma
+            cursor.execute(sql, (
+                timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                symbol,
+                signal_type,
+                self.scores.get(symbol, 0.0),
+                details.get('diff_percent', 0.0), # Ratio
+                details.get('signal_price', 0.0), # Teyit mumu kapanış fiyatı
+                conf.get('signal_volume', 0),
+                conf.get('confirm_volume', 0),
+                conf.get('signal_momentum', 0.0), # Yüzdesel momentum
+                conf.get('confirm_momentum', 0.0),
+                conf.get('signal_abs_price_change', 0.0), # Mutlak değişim
+                conf.get('confirm_abs_price_change', 0.0),
+                1 if conf.get('volume_ok', False) else 0, # Boolean to Int
+                1 if conf.get('momentum_ok', False) else 0, # Yüzdesel momentum onayı
+                1 if conf.get('abs_momentum_ok', False) else 0, # Mutlak momentum onayı
+                1 if conf.get('confirmed', False) else 0, # Orijinal teyit (Vol & %Mom)
+                'TRACKING'
+            ))
+            conn.commit()
+            signal_id = cursor.lastrowid 
+            logging.debug(f"Sinyal veritabanına eklendi (ID: {signal_id}): {symbol} {signal_type}")
+            return signal_id
+        except sqlite3.Error as e:
+            logging.error(f"SQLite sinyal ekleme hatası: {e}")
+            return None
+        finally:
+            if conn:
+                conn.close()
+
+    def log_outcome_to_db(self, signal_id: int, outcome_time: datetime, achieved_price: float, time_diff: float):
+        """Sinyal sonucunu (+%1 hedef) veritabanına yazar."""
+        conn = self._connect_db()
+        if conn is None: return
+        sql = ''' INSERT INTO outcomes(signal_id,outcome_timestamp,achieved_price,time_to_target_s) VALUES(?,?,?,?) '''
+        try:
+            cursor = conn.cursor()
+            cursor.execute(sql, (
+                signal_id,
+                outcome_time.strftime("%Y-%m-%d %H:%M:%S"),
+                achieved_price,
+                time_diff
+            ))
+            conn.commit()
+            logging.debug(f"Sonuç veritabanına eklendi (Sinyal ID: {signal_id})")
+        except sqlite3.Error as e:
+            logging.error(f"SQLite sonuç ekleme hatası: {e}")
+        finally:
+            if conn:
+                conn.close()
+                
+    def update_signal_status(self, signal_id: int, status: str):
+        """Veritabanındaki sinyalin takip durumunu günceller."""
+        conn = self._connect_db()
+        if conn is None: return
+        # tracking_status sütununu güncelle
+        sql = ''' UPDATE signals SET tracking_status = ? WHERE id = ? '''
+        try:
+            cursor = conn.cursor()
+            cursor.execute(sql, (status, signal_id))
+            conn.commit()
+            logging.debug(f"Sinyal durumu güncellendi (ID: {signal_id}, Durum: {status})")
+        except sqlite3.Error as e:
+            logging.error(f"SQLite sinyal durumu güncelleme hatası: {e}")
+        finally:
+            if conn:
+                conn.close()
+    # -----------------------------------------
+
+    def _get_symbols(self) -> List[str]:
+        """Binance'den USDT paritelerini al (Stabilcoinler ve PAXG hariç)"""
+        excluded_suffixes = ['USDC', 'BUSD', 'TUSD', 'DAI', 'USDP', 'FDUSD'] # Hariç tutulacak stabilcoinlerin temel isimleri
+        excluded_symbols = ['PAXGUSDT'] # Direkt hariç tutulacak semboller
+        target_suffix = 'USDT'
+        fetch_limit = 300 # Başlangıçta çekilecek parite sayısı (artırıldı)
+        final_limit = 200 # Sonuçta kullanılacak parite sayısı (artırıldı)
+
+        try:
+            exchange_info = self.client.get_exchange_info()
+            all_symbols = []
+            for s in exchange_info['symbols']:
+                # Sadece USDT ile biten ve durumu TRADING olanları al
+                if s['symbol'].endswith(target_suffix) and s['status'] == 'TRADING':
+                    all_symbols.append(s['symbol'])
+            
+            # Sembolleri sırala (isteğe bağlı, genellikle borsa sırası yeterli)
+            # all_symbols.sort()
+            
+            # İlk `fetch_limit` kadarını al
+            initial_list = all_symbols[:fetch_limit]
+            
+            # Filtreleme
+            filtered_symbols = []
+            for symbol in initial_list:
+                # Direkt hariç tutulanlarda var mı?
+                if symbol in excluded_symbols:
+                    continue
+                
+                # Stabilcoin paritesi mi kontrol et (örn. TUSDUSDT)
+                is_excluded_stablecoin = False
+                for suffix in excluded_suffixes:
+                    # Eğer sembol USDT ile bitiyorsa ve başı stabilcoin adıysa
+                    if symbol.startswith(suffix) and symbol.endswith(target_suffix):
+                        is_excluded_stablecoin = True
+                        break # Başka kontrol etmeye gerek yok
+                
+                if is_excluded_stablecoin:
+                    continue
+                    
+                # Tüm kontrollerden geçtiyse listeye ekle
+                filtered_symbols.append(symbol)
+
+            # Son limiti uygula
+            final_symbols = filtered_symbols[:final_limit]
+            logging.info(f"{len(final_symbols)} adet filtrelenmiş sembol yüklendi.")
+            return final_symbols
+            
+        except BinanceAPIException as e:
+            logging.error(f"Semboller alınırken hata: {e}")
+            return []
+
+    def get_klines(self, symbol: str, limit: int = 200, timeframe_override: str = None) -> pd.DataFrame:
+        """Belirli bir sembol için kline verilerini REST API ile al"""
+        selected_tf = timeframe_override if timeframe_override else self.selected_timeframe.get() # Seçili zaman dilimini al
+        try:
+            klines = self.client.get_klines(symbol=symbol, interval=selected_tf, limit=limit)
+            df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 
+                                            'close_time', 'quote_asset_volume', 'number_of_trades',
+                                            'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = df[col].astype(float)
+            df.set_index('timestamp', inplace=True) # Zamanı index yapalım
+            return df
+        except BinanceAPIException as e:
+            logging.error(f"{symbol} ({selected_tf}) için kline verisi alınırken hata: {e}")
+            return pd.DataFrame()
+
+    def calculate_rsi(self, df: pd.DataFrame) -> Tuple[float, float, float]:
+        """RSI hesaplama"""
+        # RSI hesaplamaları için pandas Series kullan
+        rsi_high = ta.momentum.RSIIndicator(pd.Series(df['high']), window=self.period).rsi()
+        rsi_low = ta.momentum.RSIIndicator(pd.Series(df['low']), window=self.period).rsi()
+        rsi_close = ta.momentum.RSIIndicator(pd.Series(df['close']), window=self.period).rsi()
+        
+        # Son değerleri al ve float'a çevir
+        rsi_high_value = float(rsi_high.iloc[-1]) if not pd.isna(rsi_high.iloc[-1]) else 0.0
+        rsi_low_value = float(rsi_low.iloc[-1]) if not pd.isna(rsi_low.iloc[-1]) else 0.0
+        rsi_close_value = float(rsi_close.iloc[-1]) if not pd.isna(rsi_close.iloc[-1]) else 0.0
+        
+        return rsi_high_value, rsi_low_value, rsi_close_value
+
+    def calculate_zscore(self, df: pd.DataFrame) -> float:
+        """Z-Score hesaplama"""
+        if len(df) < self.z_score_length:
+            return 0.0
+        ma = df['close'].rolling(window=self.z_score_length).mean()
+        std = df['close'].rolling(window=self.z_score_length).std()
+        zscore = (df['close'].iloc[-1] - ma.iloc[-1]) / std.iloc[-1] if std.iloc[-1] != 0 else 0
+        return zscore if pd.notna(zscore) else 0.0
+
+    def calculate_ratios(self, df: pd.DataFrame) -> Dict[str, float]:
+        """Çeşitli finansal oranları hesapla (Adapt edilmiş yeni mantık)"""
+        func_name = "calculate_ratios"
+        symbol = df.name if hasattr(df, 'name') else "Unknown"
+        min_len_required = max(self.period, self.z_score_length) + 1
+
+        # Başlangıç değerleri ile sözlük oluştur
+        results = {
+            'sharpe': 0.0, 'sortino': 0.0, 'calmar': 0.0, 'omega': 0.0,
+            'price_change': 0.0, 'score_raw': 0.0
+        }
+
+        if len(df) < min_len_required:
+            return results
+
+        try:
+            data = df['close'] # Artık Series
+            
+            # Logaritmik Getirileri Hesapla (vektörel)
+            close_shifted = data.shift(1)
+            valid_mask = (data > 0) & (close_shifted > 0)
+            returns = pd.Series(np.nan, index=data.index)
+            returns[valid_mask] = np.log(data[valid_mask] / close_shifted[valid_mask])
+            returns = returns.dropna()
+
+            if len(returns) < max(self.period, self.z_score_length):
+                return results # Yeterli getiri yoksa çık
+
+            # --- Hesaplamalar --- 
+            last_zscore = 0.0
+            last_sharpe = 0.0
+            last_sortino = 0.0
+            last_calmar = 0.0
+            last_omega = 0.0
+            last_weighted_score = 0.0
+            
+            # Z-Score (Her zaman hesapla, Series döndürür)
+            if len(data) >= self.z_score_length:
+                zscore_series = (
+                    (data - data.rolling(window=self.z_score_length).mean()) 
+                    / data.rolling(window=self.z_score_length).std()
+                ).fillna(0) # NaN yerine 0
+                if not zscore_series.empty and pd.notna(zscore_series.iloc[-1]):
+                    last_zscore = zscore_series.iloc[-1]
+
+            # Finansal Oranlar (use_zscore False ise)
+            if not self.use_zscore and len(returns) >= self.period:
+                avg_return_series = returns.rolling(window=self.period).mean()
+                std_return_series = returns.rolling(window=self.period).std(ddof=1)
+                
+                if not avg_return_series.empty and not std_return_series.empty and pd.notna(avg_return_series.iloc[-1]):
+                    avg_return = avg_return_series.iloc[-1]
+                    last_std = std_return_series.iloc[-1] if pd.notna(std_return_series.iloc[-1]) else 0.0
+                    
+                    # Sharpe
+                    last_sharpe = (avg_return - self.rff) / last_std if last_std != 0 else 0.0
+                    
+                    # Sortino
+                    neg_returns = returns[returns < 0]
+                    sortino = 0.0
+                    if not neg_returns.empty:
+                        neg_std_series = neg_returns.rolling(window=self.period).std(ddof=1)
+                        if not neg_std_series.empty and pd.notna(neg_std_series.iloc[-1]):
+                            last_neg_std = neg_std_series.iloc[-1]
+                            sortino = (avg_return - self.rff) / last_neg_std if last_neg_std != 0 else 0.0
+                    last_sortino = sortino
+                    
+                    # Calmar
+                    calmar = 0.0
+                    rolling_close = data.rolling(window=self.period)
+                    high_in_period = rolling_close.max()
+                    low_in_period = rolling_close.min()
+                    if not high_in_period.empty and not low_in_period.empty and pd.notna(high_in_period.iloc[-1]) and pd.notna(low_in_period.iloc[-1]):
+                        price_range = high_in_period.iloc[-1] - low_in_period.iloc[-1]
+                        calmar = avg_return / price_range if price_range != 0 else 0.0
+                    last_calmar = calmar
+                    
+                    # Omega
+                    omega = 0.0
+                    threshold = self.rff
+                    gains = returns[returns >= threshold] - threshold
+                    losses = threshold - returns[returns < threshold]
+                    if not gains.empty and not losses.empty:
+                        sum_gains_series = gains.rolling(window=self.period).sum()
+                        sum_losses_series = losses.rolling(window=self.period).sum()
+                        if not sum_gains_series.empty and not sum_losses_series.empty and pd.notna(sum_gains_series.iloc[-1]) and pd.notna(sum_losses_series.iloc[-1]):
+                            sum_gains = sum_gains_series.iloc[-1]
+                            sum_losses = sum_losses_series.iloc[-1]
+                            omega = sum_gains / sum_losses if sum_losses != 0 else 0.0 
+                    last_omega = omega
+                    
+                    # Ağırlıklı Skor
+                    last_weighted_score = (
+                        (last_sortino * 0.40 if pd.notna(last_sortino) else 0.0) + 
+                        (last_omega * 0.30 if pd.notna(last_omega) and np.isfinite(last_omega) else 0.0) + 
+                        (last_calmar * 0.20 if pd.notna(last_calmar) else 0.0) + 
+                        (last_sharpe * 0.10 if pd.notna(last_sharpe) else 0.0)
+                    )
+            
+            # Sonuçları güncelle
+            results['sharpe'] = last_sharpe if pd.notna(last_sharpe) else 0.0
+            results['sortino'] = last_sortino if pd.notna(last_sortino) else 0.0
+            results['calmar'] = last_calmar if pd.notna(last_calmar) else 0.0
+            results['omega'] = last_omega if pd.notna(last_omega) and np.isfinite(last_omega) else 0.0
+            
+            # Ham skoru ata (Z-Score veya ağırlıklı skor)
+            results['score_raw'] = last_zscore if self.use_zscore else last_weighted_score
+            results['score_raw'] = results['score_raw'] if pd.notna(results['score_raw']) else 0.0
+            
+            # Basit fiyat değişimi
+            price_change = 0.0
+            if len(data) > 1 and pd.notna(data.iloc[-1]) and pd.notna(data.iloc[-2]) and data.iloc[-2] != 0:
+                price_change = ((data.iloc[-1] - data.iloc[-2]) / data.iloc[-2]) * 100
+            results['price_change'] = price_change if pd.notna(price_change) else 0.0
+            
+            return results
+
+        except IndexError as e:
+             logging.error(f"{symbol} - {func_name}: IndexError - {e}. Veri Uzunluğu: {len(df)}, Getiri Uzunluğu: {len(returns) if 'returns' in locals() else 'N/A'}")
+             return results # Başlangıç değerlerini döndür
+        except Exception as e:
+            logging.error(f"{symbol} - {func_name}: Beklenmedik Hata - {e}", exc_info=True)
+            return results # Başlangıç değerlerini döndür
+
+    def calculate_signals(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """Alım-satım sinyallerini ve PineScript uyumlu pullback farkını hesapla"""
+        func_name = "calculate_signals"
+        symbol = df.name if hasattr(df, 'name') else "Unknown"
+        atr_period = 10
+        multiplier = 3.0
+        min_len = atr_period + 1 
+        if len(df) < min_len:
+             return {
+                'long_signal': False, 'short_signal': False, 'c20l_signal': False, 'c10l_signal': False,
+                'confirmation': {}, 'diff_percent': 0.0, 'signal_price': 0.0
+            }
+            
+        try:
+            src = df['close']
+            H_lvl = df['high']
+            L_lvl = df['low']
+            
+            # ATR 
+            atr_indicator = ta.volatility.AverageTrueRange(
+                high=H_lvl, low=L_lvl, close=src, window=atr_period, fillna=False
+            )
+            atr = atr_indicator.average_true_range()
+            first_valid_index = atr.first_valid_index()
+            if first_valid_index is None:
+                return {
+                    'long_signal': False, 'short_signal': False, 'c20l_signal': False, 'c10l_signal': False,
+                    'confirmation': {}, 'diff_percent': 0.0, 'signal_price': 0.0
+                }
+            
+            # İlk geçerli index'in integer konumunu bul
+            try:
+                first_valid_iloc = df.index.get_loc(first_valid_index)
+            except KeyError:
+                 logging.error(f"{symbol} - {func_name}: İlk geçerli ATR indeksi ({first_valid_index}) DataFrame indeksinde bulunamadı.")
+                 return { # Hata durumunda boş dön
+                    'long_signal': False, 'short_signal': False, 'c20l_signal': False, 'c10l_signal': False,
+                    'confirmation': {}, 'diff_percent': 0.0, 'signal_price': 0.0
+                 } 
+
+            # Supertrend Bantları (Pine'daki gibi)
+            pine_up_band_basic = (H_lvl + L_lvl) / 2 - multiplier * atr
+            pine_dn_band_basic = src + multiplier * atr 
+            pine_final_up = pd.Series(np.nan, index=df.index) 
+            pine_final_low = pd.Series(np.nan, index=df.index) 
+            trend = pd.Series(np.nan, index=df.index)
+            buy_signal = pd.Series(False, index=df.index)
+            sell_signal = pd.Series(False, index=df.index)
+            
+            # --- PineScript diff_percent Hesaplaması İçin Gerekli Seriler ---
+            diff_percent_series = pd.Series(np.nan, index=df.index) # Başlangıçta NaN
+            longPullbackLevel2 = pd.Series(np.nan, index=df.index) # Pine: var float longPullbackLevel2 = na
+            # shortPullbackLevel2 Pine'da var ama diff_percent için kullanılmıyor, sadece long'u set etmek için.
+            isAfterShort = pd.Series(False, index=df.index)     # Pine: var bool isAfterShort = false
+            # ----------------------------------------------------
+
+            # İlk değerler (artık iloc ile)
+            pine_final_up.iloc[first_valid_iloc] = pine_dn_band_basic.iloc[first_valid_iloc]
+            pine_final_low.iloc[first_valid_iloc] = pine_up_band_basic.iloc[first_valid_iloc]
+            trend.iloc[first_valid_iloc] = 1.0 
+
+            # Döngü (artık iloc ile)
+            for i in range(first_valid_iloc + 1, len(df)):
+                # Önceki değerleri taşı (Pullback seviyeleri ve flag için)
+                longPullbackLevel2.iloc[i] = longPullbackLevel2.iloc[i-1]
+                isAfterShort.iloc[i] = isAfterShort.iloc[i-1]
+
+                # --- Supertrend Hesaplamaları (öncekiyle aynı) --- 
+                prev_final_up = pine_final_up.iloc[i-1]
+                prev_final_low = pine_final_low.iloc[i-1]
+                prev_trend = trend.iloc[i-1]
+                prev_close = src.iloc[i-1]
+                current_close = src.iloc[i]
+                current_pine_up_basic = pine_up_band_basic.iloc[i]
+                current_pine_dn_basic = pine_dn_band_basic.iloc[i]
+                current_low = L_lvl.iloc[i]
+                current_high = H_lvl.iloc[i]
+                
+                # NaN kontrolü 
+                if pd.isna(prev_final_up) or pd.isna(prev_final_low) or pd.isna(prev_trend) or pd.isna(prev_close) or pd.isna(current_close) or pd.isna(current_pine_up_basic) or pd.isna(current_pine_dn_basic):
+                    pine_final_up.iloc[i] = prev_final_up
+                    pine_final_low.iloc[i] = prev_final_low
+                    trend.iloc[i] = prev_trend
+                    buy_signal.iloc[i] = False
+                    sell_signal.iloc[i] = False
+                    diff_percent_series.iloc[i] = diff_percent_series.iloc[i-1]
+                    continue
+                
+                # Final Bantları
+                if prev_close < prev_final_up:
+                    pine_final_up.iloc[i] = min(current_pine_dn_basic, prev_final_up)
+                else:
+                    pine_final_up.iloc[i] = current_pine_dn_basic
+                if prev_close > prev_final_low:
+                    pine_final_low.iloc[i] = max(current_pine_up_basic, prev_final_low)
+                else:
+                    pine_final_low.iloc[i] = current_pine_up_basic
+                
+                # Trend
+                current_trend = prev_trend 
+                if prev_trend == -1.0 and current_close > prev_final_up:
+                    current_trend = 1.0
+                elif prev_trend == 1.0 and current_close < prev_final_low:
+                    current_trend = -1.0
+                trend.iloc[i] = current_trend
+                
+                # Sinyaller
+                buy_signal.iloc[i] = (trend.iloc[i] == 1.0) and (prev_trend == -1.0)
+                sell_signal.iloc[i] = (trend.iloc[i] == -1.0) and (prev_trend == 1.0)
+                # ---------------------------------------------------
+
+                # --- PineScript Pullback Seviyesi Güncelleme Mantığı --- 
+                # if short_signal:
+                #    shortPullbackLevel2 := H_lvl
+                #    longPullbackLevel2 := shortPullbackLevel2 
+                #    isAfterShort := true
+                if sell_signal.iloc[i] and pd.notna(current_high):
+                    shortPullbackLevel_current = current_high # Bunu sadece long'u set etmek için kullanıyoruz
+                    longPullbackLevel2.iloc[i] = shortPullbackLevel_current # Pine'daki gibi long'u short'un high'ına set et
+                    isAfterShort.iloc[i] = True
+
+                # if long_signal and na(longPullbackLevel2):
+                #    longPullbackLevel2 := L_lvl
+                #    isAfterShort := false
+                if buy_signal.iloc[i] and pd.isna(longPullbackLevel2.iloc[i-1]) and pd.notna(current_low):
+                     longPullbackLevel2.iloc[i] = current_low
+                     # isAfterShort zaten False olmalı ilk L sinyalinde
+
+                # if long_signal and isAfterShort:
+                #    longPullbackLevel2 := L_lvl
+                #    isAfterShort := false
+                if buy_signal.iloc[i] and isAfterShort.iloc[i-1] and pd.notna(current_low):
+                    longPullbackLevel2.iloc[i] = current_low
+                    isAfterShort.iloc[i] = False
+                # ---------------------------------------------------------
+
+                # --- PineScript diff_percent Hesaplaması ---
+                # diff_percent = na(longPullbackLevel2) ? na : ((src - longPullbackLevel2) / longPullbackLevel2) * 100
+                current_pullback_level = longPullbackLevel2.iloc[i] # Sadece long seviyesini kullan
+                current_diff = np.nan # Varsayılan NaN
+                if pd.notna(current_pullback_level) and current_pullback_level != 0 and pd.notna(current_close):
+                    current_diff = ((current_close - current_pullback_level) / current_pullback_level) * 100
+                diff_percent_series.iloc[i] = current_diff
+                # -----------------------------------------
+            
+            # --- Hesaplama Sonu --- 
+            signal_price = df['close'].iloc[-1] if not df.empty else 0.0 
+            
+            # Son fark değeri
+            last_diff_percent = diff_percent_series.iloc[-1] if not diff_percent_series.empty else np.nan
+
+            # RSI Sinyalleri (PineScript crossover mantığı ile)
+            c10l_signal = False
+            c20l_signal = False
+            # En az 3 RSI değeri gerekli (son 2 değişimi hesaplamak için)
+            min_rsi_len = self.period + 2 
+            if len(df) > min_rsi_len:
+                try:
+                    rsi_indicator = ta.momentum.RSIIndicator(df['close'].dropna(), window=self.period).rsi()
+                    # En az 3 geçerli RSI değeri var mı kontrol et
+                    if not rsi_indicator.empty and len(rsi_indicator.dropna()) >= 3:
+                        # Son 3 RSI değerini al
+                        rsi_now = rsi_indicator.iloc[-1]
+                        rsi_prev = rsi_indicator.iloc[-2]
+                        rsi_prev2 = rsi_indicator.iloc[-3]
+                        
+                        # NaN kontrolü
+                        if pd.notna(rsi_now) and pd.notna(rsi_prev) and pd.notna(rsi_prev2):
+                            rsi_change_current = rsi_now - rsi_prev
+                            rsi_change_previous = rsi_prev - rsi_prev2
+                            
+                            # Crossover kontrolleri
+                            c10l_signal = (rsi_change_previous <= 10) and (rsi_change_current > 10)
+                            c20l_signal = (rsi_change_previous <= 20) and (rsi_change_current > 20)
+                            
+                except Exception as e:
+                    logging.error(f"{symbol} - {func_name}: RSI Hesaplama Hatası - {e}")
+            
+            # Teyit Kontrolü
+            confirmation = self.check_confirmation(df)
+            
+            # Son Sinyaller
+            last_long_signal = buy_signal.iloc[-1] if not buy_signal.empty and pd.notna(buy_signal.iloc[-1]) else False
+            last_short_signal = sell_signal.iloc[-1] if not sell_signal.empty and pd.notna(sell_signal.iloc[-1]) else False
+            
+            return {
+                'long_signal': last_long_signal, 
+                'short_signal': last_short_signal, 
+                'c20l_signal': c20l_signal,
+                'c10l_signal': c10l_signal,
+                'confirmation': confirmation,
+                'diff_percent': last_diff_percent if pd.notna(last_diff_percent) else 0.0, # NaN ise 0 döndür
+                'signal_price': signal_price if pd.notna(signal_price) else 0.0
+            }
+
+        except IndexError as e:
+             logging.error(f"{symbol} - {func_name}: IndexError - {e}. Veri Uzunluğu: {len(df)}")
+             return {'long_signal': False, 'short_signal': False, 'c20l_signal': False, 'c10l_signal': False, 'confirmation': {}, 'diff_percent': 0.0, 'signal_price': 0.0}
+        except Exception as e:
+            logging.error(f"{symbol} - {func_name}: Beklenmedik Hata - {e}", exc_info=True)
+            return {'long_signal': False, 'short_signal': False, 'c20l_signal': False, 'c10l_signal': False, 'confirmation': {}, 'diff_percent': 0.0, 'signal_price': 0.0}
+
+    def check_confirmation(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """Sinyal teyidini kontrol et (Yüzdesel Değişim Odaklı)"""
+        func_name = "check_confirmation"
+        symbol = df.name if hasattr(df, 'name') else "Unknown"
+
+        # Başlangıç değerleri (yeni flag'ler eklendi)
+        default_result = {
+            'confirmed': False, 
+            'volume_ok': False, 'momentum_ok': False, 'abs_momentum_ok': False,
+            'volume_perc_change_ok': False, # Yeni flag
+            'confirm_momentum_positive': False, # Yeni flag
+            'signal_volume': 0, 'confirm_volume': 0,
+            'signal_momentum': 0.0, 'confirm_momentum': 0.0,
+            'signal_abs_price_change': 0.0, 'confirm_abs_price_change': 0.0,
+            'volume_change_perc': 0.0 # Hesaplanan yüzdesel değişim
+        }
+
+        if len(df) < 3: # En az 3 mum gerekli
+            return default_result
+
+        try:
+            # Mumları ve değerleri al
+            pre_signal_candle = df.iloc[-3]
+            signal_candle = df.iloc[-2]
+            confirm_candle = df.iloc[-1]
+
+            # Değerlerin geçerliliğini kontrol et
+            required_cols = ['close', 'volume']
+            if any(pd.isna(pre_signal_candle[col]) for col in required_cols) or \
+               any(pd.isna(signal_candle[col]) for col in required_cols) or \
+               any(pd.isna(confirm_candle[col]) for col in required_cols):
+                return default_result
+
+            # --- Hacim Hesaplamaları ---
+            signal_volume = signal_candle['volume']
+            confirm_volume = confirm_candle['volume']
+            volume_ok_orig = confirm_volume >= signal_volume # Orijinal mutlak kontrol (loglama için)
+            
+            # Yeni: Hacim Yüzdesel Değişim Kontrolü
+            volume_change_perc = 0.0
+            if signal_volume > 0: # Sıfıra bölme hatasını önle
+                volume_change_perc = ((confirm_volume - signal_volume) / signal_volume) * 100
+            volume_perc_change_ok = volume_change_perc > self.VOLUME_CHANGE_PERC_THRESHOLD
+
+            # --- Momentum Hesaplamaları ---
+            signal_momentum_perc = 0.0
+            if pre_signal_candle['close'] != 0:
+                signal_momentum_perc = ((signal_candle['close'] - pre_signal_candle['close']) / pre_signal_candle['close']) * 100
+            confirm_momentum_perc = 0.0
+            if signal_candle['close'] != 0:
+                 confirm_momentum_perc = ((confirm_candle['close'] - signal_candle['close']) / signal_candle['close']) * 100
+            momentum_perc_ok_orig = confirm_momentum_perc >= signal_momentum_perc # Orijinal karşılaştırma (loglama için)
+
+            # Yeni: Teyit Mumu Momentum Kontrolü
+            confirm_momentum_positive = confirm_momentum_perc > self.CONFIRM_MOMENTUM_PERC_THRESHOLD
+
+            # --- Mutlak Fiyat Değişimi (Abs Momentum) ---
+            signal_abs_price_change = signal_candle['close'] - pre_signal_candle['close']
+            confirm_abs_price_change = confirm_candle['close'] - signal_candle['close']
+            momentum_abs_ok = confirm_abs_price_change >= signal_abs_price_change # Bu aynı kalabilir
+
+            # --- Yeni Ana Teyit Mantığı ---
+            confirmed = volume_perc_change_ok and confirm_momentum_positive
+
+            return {
+                'confirmed': confirmed, # Ana teyit artık yeni mantığa göre
+                'volume_ok': volume_ok_orig, # Orijinal kontrolü bilgi için sakla
+                'momentum_ok': momentum_perc_ok_orig, # Orijinal kontrolü bilgi için sakla
+                'abs_momentum_ok': momentum_abs_ok, 
+                'volume_perc_change_ok': volume_perc_change_ok, # Yeni kontrol sonucu
+                'confirm_momentum_positive': confirm_momentum_positive, # Yeni kontrol sonucu
+                'signal_volume': signal_volume if pd.notna(signal_volume) else 0,
+                'confirm_volume': confirm_volume if pd.notna(confirm_volume) else 0,
+                'signal_momentum': signal_momentum_perc if pd.notna(signal_momentum_perc) else 0.0,
+                'confirm_momentum': confirm_momentum_perc if pd.notna(confirm_momentum_perc) else 0.0,
+                'signal_abs_price_change': signal_abs_price_change if pd.notna(signal_abs_price_change) else 0.0,
+                'confirm_abs_price_change': confirm_abs_price_change if pd.notna(confirm_abs_price_change) else 0.0,
+                'volume_change_perc': volume_change_perc if pd.notna(volume_change_perc) else 0.0 # Hesaplanan % hacim değişimi
+            }
+
+        except IndexError:
+            return default_result
+        except Exception as e:
+            logging.error(f"{symbol} - {func_name}: Beklenmedik Hata - {e}", exc_info=True)
+            return default_result
+
+    def sort_symbols(self):
+        """Sembolleri sırala"""
+        # Score ve ratio sıralamaları için listeler oluştur
+        score_ranks = {}
+        ratio_ranks = {}
+        
+        # Score sıralaması
+        sorted_by_score = sorted(self.scores.items(), key=lambda x: x[1], reverse=True)
+        for rank, (symbol, _) in enumerate(sorted_by_score):
+            score_ranks[symbol] = rank
+        
+        # Ratio sıralaması
+        sorted_by_ratio = sorted(self.ratios.items(), key=lambda item: item[1].get('price_change', 0.0), reverse=True)
+        for rank, (symbol, _) in enumerate(sorted_by_ratio):
+            ratio_ranks[symbol] = rank
+        
+        # Eşleşen rankları bul
+        matched_symbols = []
+        for symbol in self.symbols:
+            if symbol in score_ranks and symbol in ratio_ranks:
+                if score_ranks[symbol] == ratio_ranks[symbol]:
+                    matched_symbols.append(symbol)
+        
+        return matched_symbols, score_ranks, ratio_ranks
+
+    def update_initial_data(self, timeframe_to_load: str):
+        """Belirli bir zaman dilimi için BAŞLANGIÇ verilerini REST API ile yükle."""
+        # current_tf = self.selected_timeframe.get() # -> Hata veriyordu
+        logging.info(f"[{timeframe_to_load}] update_initial_data başladı...") # LOG EKLE
+        symbols_loaded = 0
+        required_data_length = max(self.period, self.z_score_length) + 2
+
+        symbol_index = 0 # Loglama için sayaç
+        total_symbols = len(self.symbols)
+        for symbol in self.symbols:
+            symbol_index += 1
+            logging.debug(f"[{timeframe_to_load}] Başlangıç verisi yükleniyor: {symbol} ({symbol_index}/{total_symbols})") # LOG EKLE (Debug)
+            # Zaman dilimi yükleme BAŞLADIKTAN SONRA değişti mi diye kontrol et
+            # Yüklenmesi istenen TF ile bu thread'in başladığı TF farklı mı?
+            if self.currently_requested_timeframe != timeframe_to_load:
+                logging.warning(f"Başlangıç yüklemesi ({timeframe_to_load}) sırasında zaman dilimi ({self.currently_requested_timeframe}) değişti, yükleme iptal ediliyor.")
+                # GUI elemanını tekrar aktif et (hata durumu)
+                self.root.after(0, lambda: self.timeframe_combobox.config(state="readonly"))
+                return # Bu thread'i sonlandır
+
+            try:
+                # get_klines timeframe_to_load'ı kullanacak
+                df_initial = self.get_klines(symbol, limit=300, timeframe_override=timeframe_to_load)
+                if not df_initial.empty and len(df_initial) >= required_data_length:
+                    self.data[symbol] = df_initial
+                    # Başlangıç hesaplamaları
+                    self._recalculate_symbol(symbol, is_closed=True, is_initial_load=True)
+                    symbols_loaded += 1
+                    # logging.debug(f"{symbol} ({timeframe_to_load}) için başlangıç verisi yüklendi ve hesaplandı.") # Moved debug log
+                else:
+                    logging.warning(f"{symbol} ({timeframe_to_load}) için yeterli başlangıç verisi alınamadı veya yüklenemedi (Alınan: {len(df_initial)}).")
+            except Exception as e:
+                logging.error(f"{symbol} ({timeframe_to_load}) için başlangıç verisi yüklenirken hata: {e}", exc_info=False)
+
+            # === YENİ EKLENEN SATIR ===
+            time.sleep(0.1) # API çağrıları arasına küçük bir gecikme ekle
+            # ==========================
+
+        # Yükleme bittikten sonra hala bu timeframe mi isteniyor?
+        if self.currently_requested_timeframe == timeframe_to_load:
+            logging.info(f"[{timeframe_to_load}] Başlangıç veri yükleme döngüsü tamamlandı. {symbols_loaded}/{len(self.symbols)} sembol başarıyla yüklendi.") # LOG EKLE
+            logging.info(f"[{timeframe_to_load}] initial_load_complete.set() çağrılıyor.") # LOG EKLE
+            self.initial_load_complete.set() # Yüklemenin bittiğini işaretle
+
+            # Başlangıç GUI güncellemesi
+            self.root.after(0, self.filter_symbols)
+
+            # WebSocket'i başlat
+            self.root.after(0, self._init_websocket)
+
+            # GUI elemanını aktif et
+            self.root.after(0, lambda: self.timeframe_combobox.config(state="readonly"))
+        else:
+            logging.info(f"{timeframe_to_load} için başlangıç yüklemesi tamamlandı ancak zaman dilimi ({self.currently_requested_timeframe}) değiştiği için WS başlatılmıyor.")
+            # GUI elemanını aktif et (başka yükleme başlayacak)
+            self.root.after(0, lambda: self.timeframe_combobox.config(state="readonly"))
+
+    # --- WebSocket Metodları ---
+    def _init_websocket(self):
+        """WebSocket bağlantısını başlatır."""
+        base_ws_url = "wss://stream.binance.com:9443/ws" # Temel adresi kullan
+        logging.info(f"WebSocket bağlantısı başlatılıyor: {base_ws_url}")
+        # websocket.enableTrace(True) # Detaylı loglama KAPATILDI
+        self.ws = websocket.WebSocketApp(base_ws_url, # Değiştirildi
+                                      on_open=self._on_open,
+                                      on_message=self._on_message,
+                                      on_error=self._on_error,
+                                      on_close=self._on_close)
+        # WebSocket'i ayrı bir thread'de çalıştır (ping parametreleri eklendi)
+        self.ws_thread = threading.Thread(target=lambda: self.ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE}, 
+                                                                            ping_interval=60, # 60 saniyede bir ping gönder
+                                                                            ping_timeout=20), # 10 saniye yerine 20 saniye bekle
+                                        daemon=True)
+        self.ws_thread.start()
+
+    def _on_open(self, ws):
+        """WebSocket bağlantısı açıldığında çağrılır ve streamlere abone olur."""
+        logging.info("WebSocket bağlantısı başarılı (on_open tetiklendi).")
+        # Seçili zaman dilimi için TÜM sembollerin kline streamlerine abone ol
+        try:
+            current_tf = self.selected_timeframe.get() # Mutlaka burada alınmalı
+            # subscribe_limit = 5 # Test limiti KALDIRILDI
+            symbols_to_subscribe = self.symbols # Tüm semboller
+            
+            if not symbols_to_subscribe:
+                logging.warning("Abone olunacak sembol bulunamadı.")
+                return
+                
+            params = [f"{s.lower()}@kline_{current_tf}" for s in symbols_to_subscribe]
+            subscribe_message = {
+                "method": "SUBSCRIBE",
+                "params": params,
+                "id": 1 
+            }
+            ws.send(json.dumps(subscribe_message))
+            logging.info(f"{len(params)} adet stream'e abone olundu ({current_tf}).") # Log mesajı güncellendi
+        except Exception as e:
+            logging.error(f"WebSocket abone olma hatası: {e}", exc_info=True)
+
+    def _on_message(self, ws, message):
+        """WebSocket'ten mesaj geldiğinde çağrılır."""
+        # print(f"****** _ON_MESSAGE CALLED! Raw message start: {message[:100]}...") # KALDIRILDI
+        # Durdurma işareti set edilmişse işlem yapma
+        if self.stop_ws_flag.is_set():
+            return
+
+        # Ana hata yakalama bloğu (Kalsın)
+        try: 
+            # print("--- Inside outer try block ---") # KALDIRILDI
+
+            # --- ORİJİNAL İŞLEME (YENİ FORMATLA) --- 
+            try:
+                # print("--- Inside inner try block ---") # KALDIRILDI
+                data = json.loads(message)
+                # print(f"--- JSON loaded successfully. Keys: {list(data.keys())}") # KALDIRILDI
+
+                # === FORMAT KONTROLÜ DEĞİŞTİRİLDİ ===
+                # if 'stream' in data and '@kline_' in data['stream'] and 'data' in data: # ESKİ KONTROL
+                #     kline_data = data['data'] # ESKİ
+                #     if kline_data.get('e') == 'kline': # ESKİ
+                if data.get('e') == 'kline': # YENİ KONTROL: Olay tipi 'kline' mı?
+                    # print("--- Event type is 'kline' ---") # KALDIRILDI
+                    k = data.get('k') # YENİ: Kline verisi 'k' anahtarında
+                    symbol = data.get('s') # YENİ: Sembol 's' anahtarında
+                    if k is None or symbol is None:
+                        logging.warning(f"Gelen kline mesajında 'k' veya 's' anahtarı eksik: {data}")
+                        return
+                        
+                    # === /FORMAT KONTROLÜ DEĞİŞTİRİLDİ ===
+                        
+                    interval = k.get('i')
+                    is_closed = k.get('x')
+                    msg_timestamp = pd.to_datetime(data.get('E'), unit='ms') # Anahtar 'E'
+                    kline_start_time = pd.to_datetime(k.get('t'), unit='ms') # Anahtar 't'
+                    
+                    if interval is None or is_closed is None or msg_timestamp is None or kline_start_time is None:
+                         logging.warning(f"Gelen kline mesajında k['i'], k['x'], data['E'] veya k['t'] anahtarı eksik: {data}")
+                         return
+                         
+                    selected_tf = self.selected_timeframe.get()
+                    # logging.debug(f"Kline işleniyor: Sembol={symbol}, Interval={interval}, is_closed={is_closed}, SeçiliTF={selected_tf}") # KALDIRILDI
+
+                    # Sadece seçili zaman dilimi ve takip edilen sembollerle ilgilen
+                    if symbol in self.symbols and interval == selected_tf:
+                        # logging.debug(f"[{symbol}-{interval}] Sembol ve Zaman Dilimi Eşleşti. İşleme devam ediyor.") # KALDIRILDI
+
+                        # Veri setinde sembol var mı kontrol et
+                        if symbol not in self.data or self.data[symbol].empty:
+                            return
+
+                        df = self.data[symbol].copy()
+                        last_candle_timestamp = df.index[-1]
+                        
+                        # Gerekli kline değerlerini al (float dönüşümüyle)
+                        try:
+                            open_price = float(k.get('o', 0.0))
+                            high_price = float(k.get('h', 0.0))
+                            low_price = float(k.get('l', 0.0))
+                            close_price = float(k.get('c', 0.0))
+                            volume = float(k.get('v', 0.0))
+                        except (ValueError, TypeError) as conv_err:
+                            logging.error(f"[{symbol}-{interval}] Kline değerleri float'a çevrilemedi: {k}. Hata: {conv_err}")
+                            return
+                            
+                        new_kline_update = {
+                            'open': open_price,
+                            'high': high_price,
+                            'low': low_price,
+                            'close': close_price,
+                            'volume': volume
+                        }
+
+                        # Mum kapandıysa (is_closed = True):
+                        if is_closed:
+                            # logging.warning(f"****** [{symbol}-{interval}] MUM KAPANDI! Güncelleme tetiklenmeli! ******") # KALDIRILDI
+                            # logging.info(f"[{symbol}-{interval}] Mum kapandı mesajı alındı (is_closed=True). Zaman: {kline_start_time}") # KALDIRILDI
+                            # Gelen mumun başlangıç zamanı bizim son mumumuzla aynı mı?
+                            if kline_start_time == last_candle_timestamp:
+                                # Son mumu gelen kapanış verisiyle güncelle
+                                df.loc[last_candle_timestamp, list(new_kline_update.keys())] = list(new_kline_update.values())
+                                self.data[symbol] = df # Güncellenmiş DataFrame'i sakla
+                                self._recalculate_symbol(symbol, is_closed=True)
+                            # Gelen mum bizim son mumumuzdan yeni mi?
+                            elif kline_start_time > last_candle_timestamp:
+                                # Yeni bir mum geldi, eskisini atıp yenisini ekle
+                                new_df_row = pd.DataFrame([new_kline_update], index=[kline_start_time])
+                                self.data[symbol] = pd.concat([df.iloc[1:], new_df_row])
+                                self._recalculate_symbol(symbol, is_closed=True)
+                            else:
+                                # Çok eski bir kapanış mesajı, atla
+                                logging.warning(f"{symbol} ({interval}): Eski kapanmış mum ({kline_start_time}) alındı, işlenmedi. Son mum: {last_candle_timestamp}")
+                        
+                        # Mum henüz kapanmadıysa (is_closed = False):
+                        else:
+                            # Gelen güncelleme bizim son mumumuza mı ait?
+                            if kline_start_time == last_candle_timestamp:
+                                # Son satırı gelen anlık verilerle güncelle
+                                df.loc[last_candle_timestamp, 'open'] = new_kline_update['open']
+                                df.loc[last_candle_timestamp, 'high'] = max(df.loc[last_candle_timestamp, 'high'], new_kline_update['high'])
+                                df.loc[last_candle_timestamp, 'low'] = min(df.loc[last_candle_timestamp, 'low'], new_kline_update['low'])
+                                df.loc[last_candle_timestamp, 'close'] = new_kline_update['close']
+                                df.loc[last_candle_timestamp, 'volume'] = new_kline_update['volume']
+                                self.data[symbol] = df # Güncellenmiş DataFrame'i sakla
+                                # _recalculate_symbol çağrısı burada YOK (sadece kapalıda güncelliyoruz)
+                            else:
+                                # Henüz başlamamış bir mum için güncelleme?
+                                logging.debug(f"{symbol} ({interval}): Kapanmamış mum ({kline_start_time}) için güncelleme alındı ama son mum ({last_candle_timestamp}) farklı. Mum başlangıcı olarak kabul ediliyor.")
+                                # Yeni bir mum geldi, eskisini atıp yenisini ekle
+                                new_df_row = pd.DataFrame([new_kline_update], index=[kline_start_time])
+                                self.data[symbol] = pd.concat([df.iloc[1:], new_df_row])
+                    # else: # Bu blok artık if symbol in self.symbols... bloğunun dışında olmalı
+                        # print(f"--- Symbol/Timeframe mismatch: {symbol} vs tracked, {interval} vs {selected_tf} ---") 
+
+            except json.JSONDecodeError:
+                 logging.error(f"Geçersiz JSON mesajı alındı: {message}", exc_info=True) 
+            except KeyError as ke:
+                logging.error(f"Gelen mesajda beklenen anahtar bulunamadı: {ke}. Mesaj: {data}", exc_info=True)
+            except Exception as e:
+                logging.error(f"Inner try block error in _on_message: {e}", exc_info=True)
+
+        except Exception as outer_e:
+            print(f"!!!!!!!! FATAL ERROR in _on_message (outer try): {outer_e} !!!!!!!!")
+            import traceback
+            traceback.print_exc() 
+        # --- /ORİJİNAL İŞLEME ---
+
+    def _on_error(self, ws, error):
+        """WebSocket hatası oluştuğunda çağrılır."""
+        logging.error(f"WebSocket Hatası: {error}", exc_info=True) # exc_info ekle
+
+    def _on_close(self, ws, close_status_code, close_msg):
+        """WebSocket bağlantısı kapandığında çağrılır."""
+        # Eğer biz kapatmadıysak (beklenmedik kapanma) yeniden bağlanmayı dene
+        if not self.stop_ws_flag.is_set():
+            logging.warning(f"WebSocket bağlantısı beklenmedik şekilde kapandı. Kod: {close_status_code}, Mesaj: {close_msg}. 5 saniye içinde yeniden bağlanılacak...")
+            # GUI hala çalışıyorsa yeniden bağlanmayı planla
+            if self.root and self.root.winfo_exists():
+                # Yeniden bağlanmadan önce mevcut thread'in tamamen bittiğinden emin ol (isteğe bağlı ama güvenli)
+                if self.ws_thread and self.ws_thread.is_alive():
+                    try:
+                        # Kısa bir süre bekle, belki kendiliğinden biter
+                        self.ws_thread.join(timeout=1.0) 
+                    except Exception as join_err:
+                         logging.error(f"WS thread join hatası (yeniden bağlanma öncesi): {join_err}")
+                self.ws = None # WS nesnesini temizle
+                self.ws_thread = None # Thread nesnesini temizle
+                # Yeniden bağlanma işlemini ana GUI thread'ine gönder
+                self.root.after(5000, self._init_websocket) # 5 saniye sonra tekrar dene
+            else:
+                logging.warning("GUI penceresi kapalı olduğu için yeniden bağlanma işlemi iptal edildi.")
+        else:
+            logging.info(f"WebSocket bağlantısı kapatıldı (istek üzerine). Kod: {close_status_code}, Mesaj: {close_msg}")
+
+    def _recalculate_symbol(self, symbol: str, is_closed: bool, is_initial_load: bool = False):
+        """Belirli bir sembol için tüm hesaplamaları yapar ve durumu günceller.
+        
+        Args:
+            symbol (str): Hesaplanacak sembol.
+            is_closed (bool): Bu hesaplamanın kapanmış bir mum üzerine mi yapıldığı.
+            is_initial_load (bool): Başlangıç yüklemesi sırasında mı çağrıldığı.
+        """
+        # logging.debug(f"---> _recalculate_symbol çağrıldı: {symbol}, is_closed={is_closed}, is_initial_load={is_initial_load}") # KALDIRILDI
+        if symbol not in self.data:
+            return
+        
+        df_full = self.data[symbol].copy() # Hesaplamalar için kopya alalım
+        current_time = datetime.now() 
+        
+        # --- Hedef Kontrolü --- (Her zaman yapılabilir)
+        if symbol in self.active_signals_to_track:
+            track_info = self.active_signals_to_track[symbol]
+            target_price = track_info['target_price']
+            # Son 10 mumun high değerlerine bakalım (daha güvenli olması için)
+            lookback_period = 10 
+            recent_highs = df_full['high'].iloc[-lookback_period:] 
+            achieved_price = recent_highs[recent_highs >= target_price].max()
+            
+            # Detaylı Loglama Eklendi
+            logging.debug(f"[{symbol}] Hedef Kontrol: Takip Aktif. Hedef={target_price:.5f}, "
+                          f"Son {lookback_period} Highs={list(recent_highs.round(5))}, "
+                          f"Ulaşılan Max High={achieved_price if pd.notna(achieved_price) else 'Yok'}")
+
+            if pd.notna(achieved_price):
+                logging.info(f"[{symbol}] +%1 HEDEFİNE ULAŞILDI! Hedef: {target_price:.5f}, Ulaşılan: {achieved_price:.5f}")
+                signal_db_id = track_info.get('db_id')
+                outcome_timestamp = current_time 
+                time_diff = (outcome_timestamp - track_info['signal_time']).total_seconds()
+                if signal_db_id is not None:
+                     logging.info(f"[{symbol}] Sonuç veritabanına loglanıyor ve durum 'COMPLETED' olarak güncelleniyor (ID: {signal_db_id}).")
+                     self.log_outcome_to_db(signal_db_id, outcome_timestamp, achieved_price, time_diff)
+                     self.update_signal_status(signal_db_id, 'COMPLETED')
+                     if symbol in self.active_signals_to_track:
+                         # Başarıyla tamamlandığı için takipten çıkar
+                         del self.active_signals_to_track[symbol]
+                         logging.info(f"[{symbol}] Aktif takiplerden çıkarıldı.")
+                else:
+                    logging.warning(f"[{symbol}] Sonuç loglanamadı, DB ID bulunamadı. Takip devam ediyor olabilir.")
+            # else: # Hedefe henüz ulaşılmadıysa (Debug logu yukarıda zaten var)
+            #    pass 
+        # -----------------------
+        
+        # --- Ana Hesaplamalar --- 
+        # PineScript mantığı genellikle kapanmış barlara bakar. 
+        # Sinyal ve oran hesaplamaları için bir önceki bara kadar olan veriyi kullan.
+        if len(df_full) < 2: return 
+        df_closed = df_full.iloc[:-1].copy() 
+        df_closed.name = symbol 
+
+        min_len_for_calc = max(self.period, self.z_score_length) + 1 
+        if len(df_closed) >= min_len_for_calc: 
+            # 1. Hesaplamaları kapalı mumlara göre yap ve sakla
+            ratios = self.calculate_ratios(df_closed) 
+            signals = self.calculate_signals(df_closed) # Temel sinyaller df_closed'dan
+            confirmation = self.check_confirmation(df_full) # Teyit df_full'dan
+            signals['confirmation'] = confirmation 
+            zscore_closed = self.calculate_zscore(df_closed) # Kapalı mum Z-skoru
+            
+            score_closed = 0.0 
+            if self.use_zscore:
+                score_closed = zscore_closed 
+            else:
+                score_closed = ratios.get('score_raw', 0.0) 
+            
+            self.scores[symbol] = score_closed if pd.notna(score_closed) else 0.0
+            self.ratios[symbol] = ratios 
+            self.signals[symbol] = signals # confirmation dahil
+
+            # --- Sinyal Teyidi, Loglama ve Takip (SADECE MUM KAPANDIYSA) ---
+            if is_closed:
+                matched_symbols, score_ranks, ratio_ranks = self.sort_symbols()
+                has_base_signal_raw = signals.get('c20l_signal', False) or signals.get('c10l_signal', False)
+                is_rank_matched = symbol in matched_symbols
+
+                # Get confirmation details
+                confirmation_details = signals.get('confirmation', {})
+                volume_ok = confirmation_details.get('volume_perc_change_ok', False)
+                momentum_ok = confirmation_details.get('confirm_momentum_positive', False)
+
+                # --- Define Confirmation Types ---
+                is_fully_confirmed = volume_ok and momentum_ok
+                is_volume_only_confirmed = volume_ok and not momentum_ok
+
+                # --- Condition for potential tracking (Base Signal + Rank Match + (Volume OR Full Confirmation)) ---
+                has_base_signal_and_rank = has_base_signal_raw and is_rank_matched
+                should_consider_tracking = has_base_signal_and_rank and volume_ok # Track if at least volume is OK
+
+                ml_prediction_confirms = True # Default
+                ml_status_for_gui = "N/A"     # Default
+                confirmation_type_for_log = "" # To store confirmation type if tracked
+
+                # --- ML Prediction (Run if potentially tracking) ---
+                if self.ml_model and should_consider_tracking:
+                    try:
+                        # Prepare features (same features used regardless of V or V+M confirmation for now)
+                        features_for_prediction = {
+                             'score': score_closed,
+                             'signal_ratio': signals.get('diff_percent', 0.0),
+                             'signal_volume': confirmation_details.get('signal_volume', 0),
+                             'confirm_volume': confirmation_details.get('confirm_volume', 0),
+                             'signal_momentum_perc': confirmation_details.get('signal_momentum', 0.0),
+                             'confirm_momentum_perc': confirmation_details.get('confirm_momentum', 0.0),
+                             'signal_abs_price_change': confirmation_details.get('signal_abs_price_change', 0.0),
+                             'confirm_abs_price_change': confirmation_details.get('confirm_abs_price_change', 0.0),
+                             'volume_ok': 1 if confirmation_details.get('volume_ok', False) else 0, # Original volume check
+                             'momentum_perc_ok': 1 if confirmation_details.get('momentum_ok', False) else 0, # Original momentum check
+                             'momentum_abs_ok': 1 if confirmation_details.get('abs_momentum_ok', False) else 0,
+                             # 'is_confirmed_orig' might need adjustment based on how ML was trained
+                             'is_confirmed_orig': 1 if is_fully_confirmed else 0, # Pass full confirmation status
+                         }
+                        if hasattr(self.ml_model, 'feature_names_in_'):
+                            feature_values = [features_for_prediction[feat] for feat in self.ml_model.feature_names_in_]
+                            features_df = pd.DataFrame([feature_values], columns=self.ml_model.feature_names_in_)
+                        else:
+                             logging.warning(f"[{symbol}] ML model does not have feature_names_in_. Using predefined order (may be risky).")
+                             fallback_features = [
+                                'score', 'signal_ratio', 'signal_volume', 'confirm_volume',
+                                'signal_momentum_perc', 'confirm_momentum_perc', 'signal_abs_price_change', 'confirm_abs_price_change',
+                                'volume_ok', 'momentum_perc_ok', 'momentum_abs_ok', 'is_confirmed_orig'
+                             ]
+                             feature_values = [features_for_prediction[feat] for feat in fallback_features]
+                             features_df = pd.DataFrame([feature_values], columns=fallback_features)
+
+                        probabilities = self.ml_model.predict_proba(features_df)
+                        probability_of_success = probabilities[0][1]
+                        logging.info(f"[{symbol}] ML Prediction (considering Volume OK): Success Probability = {probability_of_success:.4f} (Threshold: {self.ML_CONFIDENCE_THRESHOLD})")
+
+                        if probability_of_success >= self.ML_CONFIDENCE_THRESHOLD:
+                            ml_prediction_confirms = True
+                            ml_status_for_gui = "ML OK"
+                        else:
+                            ml_prediction_confirms = False
+                            ml_status_for_gui = "ML Rejected"
+
+                    except Exception as ml_err:
+                         logging.error(f"[{symbol}] ML prediction error: {ml_err}", exc_info=True)
+                         ml_prediction_confirms = False
+                         ml_status_for_gui = "ML Error"
+
+                self.ml_predictions[symbol] = ml_status_for_gui if self.ml_model else "ML N/A"
+
+                # --- Tracking Decision (Handle both confirmation types) ---
+                should_track = False
+                if has_base_signal_and_rank and ml_prediction_confirms:
+                    if is_fully_confirmed:
+                        should_track = True
+                        confirmation_type_for_log = "Tam (V+M)"
+                    elif is_volume_only_confirmed:
+                        should_track = True
+                        confirmation_type_for_log = "Hacim (V)"
+
+                if should_track:
+                    if symbol not in self.active_signals_to_track:
+                        signal_time = current_time
+                        signal_price = df_full['close'].iloc[-1]
+                        signal_type = 'C20L' if signals.get('c20l_signal', False) else 'C10L'
+
+                        if pd.notna(signal_price) and signal_price > 0:
+                            log_details = signals.copy()
+                            signal_db_id = self.log_signal_to_db(symbol, signal_type, signal_time, log_details)
+                            if signal_db_id is not None:
+                                target_price = signal_price * 1.01
+                                logging.info(f"[{symbol}] Onaylı ({confirmation_type_for_log} OK, ML OK) {signal_type} sinyali! Fiyat: {signal_price:.4f}, Hedef: {target_price:.4f}. DB ID: {signal_db_id}. Takibe alınıyor.")
+                                self.active_signals_to_track[symbol] = {
+                                    'target_price': target_price,
+                                    'signal_time': signal_time,
+                                    'signal_price': signal_price,
+                                    'signal_type': signal_type,
+                                    'db_id': signal_db_id,
+                                    'confirmation_type': confirmation_type_for_log # Optional: Store type
+                                }
+                                self.update_signal_history(symbol, signals)
+                            else:
+                                 logging.warning(f"[{symbol}] Sinyal ({confirmation_type_for_log} OK) veritabanına loglanamadı, takip başlatılamadı.")
+                        else:
+                             logging.warning(f"[{symbol}] Sinyal ({confirmation_type_for_log} OK) fiyatı ({signal_price}) geçersiz olduğu için takip başlatılamadı.")
+                    # else: Already tracking
+
+                # --- Logging for other scenarios ---
+                elif should_consider_tracking and not ml_prediction_confirms: # Had volume OK but ML rejected
+                     log_confirm_type = "Tam (V+M)" if is_fully_confirmed else "Hacim (V)"
+                     logging.info(f"[{symbol}] Sinyal bulundu ({log_confirm_type} OK), ancak ML modeli reddetti ({ml_status_for_gui}). Takip edilmiyor.")
+                elif has_base_signal_and_rank and not volume_ok: # Base signal but volume not OK
+                     logging.info(f"[{symbol}] Temel sinyal ve rank eşleşmesi var AMA HACİM KRİTERİ (%+{self.VOLUME_CHANGE_PERC_THRESHOLD}) SAĞLANMADI. "
+                                  f"(Gerçekleşen Hacim Değişimi: {confirmation_details.get('volume_change_perc', 0.0):.2f}%)")
+
+                # GUI Update (always run if closed)
+                if not is_initial_load:
+                     self.root.after(0, self._update_single_symbol_gui, symbol)
+        else:
+            # Yeterli veri yoksa veya mum kapanmadıysa ML durumu temizle
+            self.ml_predictions.pop(symbol, None)
+            # Yeterli veri yoksa hesaplama yapma
+            pass
+
+    def update_signal_history(self, symbol: str, signals: dict):
+        """Sinyal geçmişini güncelle (Takibe alınan sinyalleri ekle)"""
+        # Bu fonksiyon _recalculate_symbol içinde, takibe alınan sinyaller için çağrılır.
+        current_time = datetime.now().strftime("%H:%M:%S")
+        confirmation_details = signals.get('confirmation', {})
+
+        # Gerçek teyit durumunu al
+        volume_ok = confirmation_details.get('volume_perc_change_ok', False)
+        momentum_ok = confirmation_details.get('confirm_momentum_positive', False)
+        volume_ok_char = "✓" if volume_ok else "✗"
+        momentum_ok_char = "✓" if momentum_ok else "✗"
+
+        # Teyit metnini oluştur
+        confirm_status = f"[V:{volume_ok_char}, M:{momentum_ok_char}]"
+
+        if symbol not in self.signal_history:
+            self.signal_history[symbol] = []
+
+        signal_text = None
+        if signals.get('c20l_signal', False):
+            signal_text = f"C20L {confirm_status}"
+        elif signals.get('c10l_signal', False):
+            signal_text = f"C10L {confirm_status}"
+
+        # Sadece geçerli bir sinyal metni varsa ve son eklenenle aynı değilse ekle
+        if signal_text:
+            last_entry = self.signal_history[symbol][-1] if self.signal_history[symbol] else None
+            if not last_entry or last_entry[0] != signal_text:
+                 # Takibe alındığı için direkt ekle
+                 self.signal_history[symbol].append((signal_text, current_time))
+                 # Son 10 kaydı tut
+                 self.signal_history[symbol] = self.signal_history[symbol][-10:]
+
+    def get_signal_history_text(self, symbol: str) -> str:
+        """Sinyal geçmişi metnini oluştur"""
+        if symbol not in self.signal_history or not self.signal_history[symbol]:
+            return "-"
+        recent_signals = self.signal_history[symbol][-3:]
+        return " | ".join([f"{signal}({time})" for signal, time in recent_signals])
+
+    def filter_symbols(self, *args):
+        """Tarayıcı tablosunu filtreler ve yeniden çizer (Tüm tablo için)"""
+        search_text = self.search_var.get().upper()
+        
+        # Önce mevcut tüm öğeleri temizle
+        for item in self.tree_scanner.get_children():
+            try: # Öğeyi silerken hata oluşabilir, yakala
+                self.tree_scanner.delete(item)
+            except tk.TclError:
+                logging.warning(f"Treeview öğesi silinirken hata oluştu (muhtemelen zaten silinmiş): {item}")
+                pass 
+        self.symbol_to_tree_item.clear() # Eşleşmeyi de temizle
+            
+        displayed_symbols_count = 0
+        # Verilerin mevcut olduğundan emin olmak için self.symbols üzerinden git
+        for symbol in self.symbols:
+            # Sembol için hesaplanmış veri var mı kontrol et
+            if symbol not in self.scores or symbol not in self.ratios or symbol not in self.signals:
+                continue 
+                
+            temp_formatted_symbol = f"{symbol}" # Sıra nosu olmadan arama
+            if not search_text or search_text in symbol or search_text in temp_formatted_symbol:
+                displayed_symbols_count += 1
+                # Verileri hazırla
+                values = self._prepare_scanner_row_values(symbol, displayed_symbols_count)
+                # Öğeyi ekle ve ID'sini sakla
+                try:
+                    item_id = self.tree_scanner.insert('', 'end', values=values)
+                    self.symbol_to_tree_item[symbol] = item_id
+                except Exception as e:
+                    logging.error(f"Treeview'e {symbol} eklenirken hata: {e}")
+
+    def _prepare_scanner_row_values(self, symbol: str, display_rank: int) -> Tuple:
+        """Bir sembol için Treeview satır değerlerini hazırlar."""
+        score = self.scores.get(symbol, 0.0)
+        ratio_info = self.ratios.get(symbol, {'price_change': 0.0})
+        signals = self.signals.get(symbol, {})
+        signal_history_str = self.get_signal_history_text(symbol)
+
+        display_score = score
+        display_ratio = signals.get('diff_percent', 0.0)
+
+        matched_symbols, score_ranks, ratio_ranks = self.sort_symbols()
+        has_base_signal_raw = signals.get('c20l_signal', False) or signals.get('c10l_signal', False)
+        is_rank_matched = symbol in matched_symbols
+        has_base_signal_and_rank = has_base_signal_raw and is_rank_matched
+
+        confirmation = signals.get('confirmation', {})
+        volume_ok = confirmation.get('volume_perc_change_ok', False)
+        momentum_ok = confirmation.get('confirm_momentum_positive', False)
+        is_fully_confirmed = volume_ok and momentum_ok
+        is_volume_only_confirmed = volume_ok and not momentum_ok
+
+        is_currently_tracking = symbol in self.active_signals_to_track
+        ml_status = self.ml_predictions.get(symbol, "ML N/A") # ML tahmin durumunu al
+
+        # Status Metnini Oluştur
+        status = "Inactive"
+        if has_base_signal_and_rank:
+            if is_currently_tracking:
+                # Determine confirmation type from active_signals_to_track if available
+                track_info = self.active_signals_to_track.get(symbol, {})
+                confirmation_type = track_info.get('confirmation_type', '') # e.g., "Tam (V+M)" or "Hacim (V)"
+                confirm_tag = f"({confirmation_type} OK, {ml_status})" if confirmation_type else f"(ML: {ml_status})" # Fallback if type not stored
+                status = f"Tracking {confirm_tag}"
+            elif volume_ok: # Has base signal, rank match, volume OK, but not tracking (maybe ML rejected or just confirmed)
+                 confirm_status_tag = "(V+M OK)" if is_fully_confirmed else "(V OK)"
+                 status = f"Confirmed {confirm_status_tag} ({ml_status})"
+                 if ml_status == "ML Rejected":
+                      status = f"Confirmed {confirm_status_tag} (ML Rejected)"
+                 elif ml_status == "N/A": # Not yet evaluated by ML or no ML model
+                      status = f"Confirmed {confirm_status_tag} (ML N/A)"
+                 # If ML OK but not tracking, implies it was just confirmed now or DB log failed
+            else: # Has base signal and rank match, but volume is not OK
+                status = "Active (Waiting Vol)"
+
+        # Signals Metnini Oluştur
+        signal_text = "-"
+        if has_base_signal_and_rank:
+            # Display the actual V/M status regardless of tracking criteria
+            vol_ok_char = "✓" if volume_ok else "✗"
+            mom_ok_char = "✓" if momentum_ok else "✗"
+            sig_type = "C20L" if signals.get('c20l_signal', False) else "C10L"
+            signal_text = f"{sig_type} [V:{vol_ok_char}, M:{mom_ok_char}]"
+
+        # Rank Eşleşme Metnini Oluştur
+        score_rank = score_ranks.get(symbol, -1)
+        ratio_rank = ratio_ranks.get(symbol, -1)
+        rank_match_char = " ✓" if score_rank != -1 and score_rank == ratio_rank else ""
+
+        return (
+            str(display_rank) if display_rank > 0 else '-',
+            symbol,
+            f"{display_score:.2f} ({score_rank+1}){rank_match_char}",
+            f"{display_ratio:.2f}% ({ratio_rank+1})",
+            signal_text,
+            status,
+            signal_history_str
+        )
+
+    def _update_single_symbol_gui(self, symbol: str):
+        """GUI'de sadece belirli bir sembolün satırını günceller."""
+        logging.debug(f"---> _update_single_symbol_gui çağrıldı: {symbol}") # LOG EKLE (DEBUG)
+        if symbol in self.symbol_to_tree_item:
+            item_id = self.symbol_to_tree_item[symbol]
+            # Güncel değerleri hazırla (Sıra no değişmez, mevcut olandan al)
+            try:
+                current_values = self.tree_scanner.item(item_id, 'values')
+                current_display_index = current_values[0] if current_values else '-' # İlk sütun sıra no
+                
+                new_values = self._prepare_scanner_row_values(symbol, 
+                                                               int(current_display_index) if current_display_index.isdigit() else 0)
+                logging.debug(f"[{symbol}] GUI satırı güncelleniyor. ID: {item_id}, Yeni Değerler: {new_values}") # LOG EKLE (DEBUG)
+                self.tree_scanner.item(item_id, values=new_values)
+                
+            except tk.TclError:
+                # Öğe silinmiş olabilir (örn. arama filtresi değiştiyse)
+                logging.warning(f"GUI güncellenirken öğe bulunamadı: {symbol} (ID: {item_id})", exc_info=True) 
+                if symbol in self.symbol_to_tree_item:
+                    del self.symbol_to_tree_item[symbol] # Eşleşmeyi kaldır
+            except Exception as e:
+                 logging.error(f"Tek satır GUI güncelleme hatası ({symbol}): {e}", exc_info=True) 
+        else:
+            pass
+
+    def get_successful_trades(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Veritabanından +%1 hedefine ulaşmış başarılı işlemleri çeker."""
+        conn = self._connect_db()
+        if conn is None: return []
+        sql = ''' 
+        SELECT 
+            s.timestamp as signal_timestamp,
+            s.symbol,
+            s.signal_type,
+            s.signal_price,
+            s.score,
+            s.ratio, 
+            s.tracking_status, -- Renamed from status
+            o.outcome_timestamp,
+            o.achieved_price,
+            o.time_to_target_s
+        FROM outcomes o
+        JOIN signals s ON o.signal_id = s.id
+        WHERE s.tracking_status = 'COMPLETED' 
+        ORDER BY o.outcome_timestamp DESC
+        LIMIT ?
+        '''
+        trades = []
+        try:
+            cursor = conn.cursor()
+            cursor.execute(sql, (limit,))
+            rows = cursor.fetchall()
+            for row in rows:
+                trades.append(dict(row))
+            logging.info(f"{len(trades)} adet başarılı işlem veritabanından çekildi (Limit: {limit}).")
+            return trades
+        except sqlite3.Error as e:
+            logging.error(f"SQLite başarılı işlem çekme hatası: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def run(self):
+        """Programı başlat (WebSocket Entegrasyonu ile)"""
+        logging.info("------ 'run' metodu başlatıldı. ------") # LOG EKLE
+        # 1. Başlangıç zaman dilimini al
+        initial_timeframe = self.selected_timeframe.get()
+        # 2. Başlangıç verilerini yükle (ayrı thread'de)
+        initial_load_thread = threading.Thread(target=self.update_initial_data, args=(initial_timeframe,), daemon=True)
+        initial_load_thread.start()
+
+        # 3. Başlangıç yüklemesinin bitmesini bekle
+        logging.info("------ Başlangıç veri yüklemesi bekleniyor (initial_load_complete.wait())... ------") # LOG EKLE
+        self.initial_load_complete.wait() # Event set edilene kadar bekler
+        logging.info("------ Başlangıç veri yüklemesi tamamlandı (initial_load_complete.wait() geçildi). ------") # LOG EKLE
+        # WebSocket başlatma artık update_initial_data içinde
+        # logging.info("Başlangıç veri yüklemesi tamamlandı. WebSocket başlatılıyor...")
+        # self._init_websocket()
+
+        # 4. GUI'yi başlat (ana thread'de)
+        logging.info("------ GUI başlatılıyor (root.mainloop())... ------") # LOG EKLE
+        self.root.mainloop()
+
+        # GUI kapandığında WebSocket'i de kapat (isteğe bağlı)
+        if self.ws:
+            logging.info("WebSocket kapatılıyor...")
+            self.ws.close()
+        logging.info("Program sonlandı.")
+
+    # --- GUI Metodları ---
+    def setup_gui(self):
+        """GUI bileşenlerini ve sekmeleri oluştur"""
+        # Ana Frame
+        self.main_frame = ttk.Frame(self.root, padding="10")
+        self.main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+
+        # Üst Kontrol Frame'i (Arama + Zaman Dilimi)
+        control_frame = ttk.Frame(self.main_frame)
+        control_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        control_frame.columnconfigure(1, weight=1) # Arama kutusu genişlesin
+
+        # Zaman Dilimi Seçimi
+        timeframe_label = ttk.Label(control_frame, text="Zaman Dilimi:")
+        timeframe_label.grid(row=0, column=0, padx=(0, 5), sticky=tk.W)
+        self.timeframe_combobox = ttk.Combobox(
+            control_frame, 
+            textvariable=self.selected_timeframe, 
+            values=self.available_timeframes,
+            state="readonly" # Kullanıcı sadece seçebilir
+        )
+        self.timeframe_combobox.grid(row=0, column=1, padx=(0, 20), sticky=tk.W)
+
+        # Arama Kutusu
+        search_label = ttk.Label(control_frame, text="Parite Ara:")
+        search_label.grid(row=0, column=2, padx=(0, 5), sticky=tk.W)
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(control_frame, textvariable=self.search_var)
+        self.search_entry.grid(row=0, column=3, sticky=(tk.W, tk.E))
+        # Arama değiştiğinde tüm tabloyu yeniden çiz (wrapper ile)
+        self.search_var.trace('w', self._filter_symbols_wrapper)
+
+        # Sekme Yöneticisi (Notebook)
+        self.notebook = ttk.Notebook(self.main_frame)
+        self.notebook.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.main_frame.columnconfigure(0, weight=1)
+        self.main_frame.rowconfigure(1, weight=1)
+        
+        # --- Sekme 1: Tarayıcı --- 
+        self.scanner_tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(self.scanner_tab, text='Tarayıcı')
+        self.scanner_tab.columnconfigure(0, weight=1)
+        self.scanner_tab.rowconfigure(0, weight=1) # Treeview satırı genişlesin
+                
+        tree_frame_scanner = ttk.Frame(self.scanner_tab)
+        tree_frame_scanner.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        tree_frame_scanner.columnconfigure(0, weight=1)
+        tree_frame_scanner.rowconfigure(0, weight=1)
+
+        columns_scanner = ('#', 'Symbol', 'Score', 'Ratio', 'Signals', 'Status', 'Signal History') # Sıra no için '#' ekle
+        self.tree_scanner = ttk.Treeview(tree_frame_scanner, columns=columns_scanner, show='headings')
+        self.tree_scanner.heading('#', text='#')
+        self.tree_scanner.heading('Symbol', text='Symbol')
+        self.tree_scanner.heading('Score', text='Score')
+        self.tree_scanner.heading('Ratio', text='Ratio (%)') # Ratio başlığını güncelle
+        self.tree_scanner.heading('Signals', text='Signals')
+        self.tree_scanner.heading('Status', text='Status')
+        self.tree_scanner.heading('Signal History', text='Signal History')
+        self.tree_scanner.column('#', width=40, anchor='center')
+        self.tree_scanner.column('Symbol', width=120)
+        self.tree_scanner.column('Score', width=120)
+        self.tree_scanner.column('Ratio', width=100) # Ratio genişliğini ayarla
+        self.tree_scanner.column('Signals', width=200)
+        self.tree_scanner.column('Status', width=120)
+        self.tree_scanner.column('Signal History', width=200)
+        scrollbar_scanner = ttk.Scrollbar(tree_frame_scanner, orient=tk.VERTICAL, command=self.tree_scanner.yview)
+        self.tree_scanner.configure(yscrollcommand=scrollbar_scanner.set)
+        self.tree_scanner.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        scrollbar_scanner.grid(row=0, column=1, sticky=(tk.N, tk.S))
+
+        # --- Sekme 2: Başarılı İşlemler ---
+        self.trades_tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(self.trades_tab, text='Başarılı İşlemler (+%1)')
+        self.trades_tab.columnconfigure(0, weight=1)
+        self.trades_tab.rowconfigure(1, weight=1)
+        refresh_frame = ttk.Frame(self.trades_tab)
+        refresh_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        self.refresh_button = ttk.Button(refresh_frame, text="Listeyi Yenile", command=self.refresh_successful_trades_tab)
+        self.refresh_button.pack(side=tk.LEFT)
+        tree_frame_trades = ttk.Frame(self.trades_tab)
+        tree_frame_trades.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        tree_frame_trades.columnconfigure(0, weight=1)
+        tree_frame_trades.rowconfigure(0, weight=1)
+        columns_trades = ('Signal Time', 'Symbol', 'Type', 'Signal Price', 'Score', 'Ratio', 'Outcome Time', 'Target Time (s)')
+        self.tree_trades = ttk.Treeview(tree_frame_trades, columns=columns_trades, show='headings')
+        self.tree_trades.heading('Signal Time', text='Sinyal Zamanı')
+        self.tree_trades.heading('Symbol', text='Sembol')
+        self.tree_trades.heading('Type', text='Tip')
+        self.tree_trades.heading('Signal Price', text='Sinyal Fiyatı')
+        self.tree_trades.heading('Score', text='Skor')
+        self.tree_trades.heading('Ratio', text='Oran(%)') # diff_percent
+        self.tree_trades.heading('Outcome Time', text='Sonuç Zamanı')
+        self.tree_trades.heading('Target Time (s)', text='Süre(s)')
+        self.tree_trades.column('Signal Time', width=140)
+        self.tree_trades.column('Symbol', width=100)
+        self.tree_trades.column('Type', width=60)
+        self.tree_trades.column('Signal Price', width=100)
+        self.tree_trades.column('Score', width=80)
+        self.tree_trades.column('Ratio', width=80)
+        self.tree_trades.column('Outcome Time', width=140)
+        self.tree_trades.column('Target Time (s)', width=80)
+        scrollbar_trades = ttk.Scrollbar(tree_frame_trades, orient=tk.VERTICAL, command=self.tree_trades.yview)
+        self.tree_trades.configure(yscrollcommand=scrollbar_trades.set)
+        self.tree_trades.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        scrollbar_trades.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        self.refresh_successful_trades_tab()
+
+        # --- Sekme 3: Trade Outcomes (EĞER KULLANILIYORSA) --- 
+        # Eğer refresh_trade_outcomes_tab ve ilgili GUI elemanları kullanılıyorsa
+        # bu sekme burada tanımlanmalı. Değilse, bu kısmı atlayabilirsiniz.
+        # Örnek:
+        # self.outcomes_tab = ttk.Frame(self.notebook, padding="10")
+        # self.notebook.add(self.outcomes_tab, text='Trade Outcomes') 
+        # ... (outcomes tab setup) ...
+        # self.refresh_trade_outcomes_tab()
+
+        # --- YENİ Sekme: ML Model ---
+        self.ml_tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(self.ml_tab, text='ML Model')
+        self.ml_tab.columnconfigure(0, weight=1)
+        self.ml_tab.rowconfigure(2, weight=1) # Text area satırı için row index'i 2 yapıldı
+
+        # Üst Frame (Butonlar için)
+        ml_control_frame = ttk.Frame(self.ml_tab)
+        ml_control_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 5)) # Butonlar arası biraz boşluk
+
+        # ML Eğitim Butonu
+        self.train_ml_button = ttk.Button(
+            ml_control_frame, 
+            text="Train Prediction Model", 
+            command=self.train_and_evaluate_model 
+        )
+        self.train_ml_button.pack(side=tk.LEFT, padx=(0, 10)) # Sağına biraz boşluk
+
+        # CSV Export Butonu (YENİ EKLENDİ)
+        self.export_csv_button = ttk.Button(
+            ml_control_frame,
+            text="Export Signals to CSV",
+            command=self.export_signals_to_csv # Bu fonksiyonu çağıracak
+        )
+        self.export_csv_button.pack(side=tk.LEFT)
+
+        # Model Değerlendirme Başlığı (YENİ EKLENDİ)
+        ml_results_label = ttk.Label(self.ml_tab, text="Model Evaluation Results:")
+        ml_results_label.grid(row=1, column=0, sticky=tk.W, pady=(5, 2)) # Text alanının üstüne başlık
+
+        # Sonuçları Göstermek İçin Text Alanı
+        ml_results_frame = ttk.Frame(self.ml_tab)
+        ml_results_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S)) # Row index 2 oldu
+        ml_results_frame.columnconfigure(0, weight=1)
+        ml_results_frame.rowconfigure(0, weight=1)
+
+        self.ml_results_text_widget = tk.Text(
+            ml_results_frame, 
+            wrap=tk.WORD, 
+            state=tk.DISABLED, 
+            height=15 
+        )
+        scrollbar_ml_results = ttk.Scrollbar(
+            ml_results_frame, 
+            orient=tk.VERTICAL, 
+            command=self.ml_results_text_widget.yview
+        )
+        self.ml_results_text_widget.configure(yscrollcommand=scrollbar_ml_results.set)
+        
+        self.ml_results_text_widget.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        scrollbar_ml_results.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        
+        # Başlangıçta başarılı işlemler sekmesini yenile (artık GUI hazır)
+        self.refresh_successful_trades_tab()
+        # Eğer outcomes tablosu kullanılıyorsa:
+        # self.refresh_trade_outcomes_tab() 
+        
+    def refresh_successful_trades_tab(self):
+        """Başarılı İşlemler sekmesindeki tabloyu veritabanından günceller."""
+        # Önce mevcut verileri temizle
+        for item in self.tree_trades.get_children():
+            self.tree_trades.delete(item)
+            
+        # Veritabanından başarılı işlemleri çek
+        successful_trades = self.get_successful_trades(limit=200) # Son 200 işlemi gösterelim
+        
+        # Tabloyu doldur
+        for trade in successful_trades:
+            # Verileri formatla
+            signal_price_formatted = f"{trade.get('signal_price', 0.0):.5f}"
+            score_formatted = f"{trade.get('score', 0.0):.2f}"
+            ratio_formatted = f"{trade.get('ratio', 0.0):.2f}" # Bu ratio diff_percent
+            target_time_formatted = f"{trade.get('time_to_target_s', 0.0):.0f}"
+            
+            values = (
+                trade.get('signal_timestamp', ''),
+                trade.get('symbol', ''),
+                trade.get('signal_type', ''),
+                signal_price_formatted,
+                score_formatted,
+                ratio_formatted,
+                trade.get('outcome_timestamp', ''),
+                target_time_formatted
+            )
+            self.tree_trades.insert('', 'end', values=values)
+        logging.info("Başarılı işlemler tablosu güncellendi.")
+
+    def _filter_symbols_wrapper(self, *args):
+        """ Arama kutusu için trace callback sarmalayıcısı """
+        # GUI güncellemelerini ana thread'e yönlendir (küçük bir gecikmeyle)
+        self.root.after(100, self.filter_symbols)
+
+    def _on_timeframe_selected_wrapper(self, *args):
+        """ Zaman dilimi seçimi için trace callback sarmalayıcısı """
+        # Zaman dilimi değişikliğini ayrı bir thread'de yap ki GUI donmasın
+        # Not: GUI elemanlarını (combobox disable/enable) yönetmek için yine
+        # self.root.after gerekebilir.
+        # Şimdilik basit tutalım, doğrudan çağıralım ama uzun sürebilir.
+        # Daha iyisi: Bir thread başlatıp o thread içinden GUI'yi güncellemek.
+
+        # Seçilen değeri al (StringVar zaten güncellenmiş olmalı)
+        new_timeframe = self.selected_timeframe.get()
+        logging.info(f"Zaman dilimi değiştiriliyor: {new_timeframe}")
+
+        # Yüklenmesi istenen zaman dilimini GÜNCELLE (thread başlamadan ÖNCE)
+        self.currently_requested_timeframe = new_timeframe
+
+        # Değişikliği işleyecek fonksiyonu çağır (thread içinde daha iyi olabilir)
+        # Thread kullanmak GUI'nin donmasını engeller ama karmaşıklığı artırır.
+        # Şimdilik doğrudan çağıralım:
+        threading.Thread(target=self._handle_timeframe_change, args=(new_timeframe,), daemon=True).start()
+
+    def _handle_timeframe_change(self, new_timeframe: str):
+        """ Zaman dilimi değişikliğini işler (WebSocket durdurma, veri temizleme, yeniden başlatma) """
+        # GUI elemanını devre dışı bırak (ana thread üzerinden)
+        self.root.after(0, lambda: self.timeframe_combobox.config(state="disabled"))
+        
+        # 1. Mevcut WebSocket'i durdur
+        if self.ws:
+            logging.info("Mevcut WebSocket bağlantısı durduruluyor...")
+            self.stop_ws_flag.set() # Durdurma işaretini set et
+            self.ws.close()
+            if self.ws_thread and self.ws_thread.is_alive():
+                self.ws_thread.join(timeout=5) # Thread'in bitmesini bekle (max 5sn)
+            if self.ws_thread and self.ws_thread.is_alive():
+                 logging.warning("WebSocket thread'i zamanında durmadı.")
+            self.ws = None
+            self.ws_thread = None
+            self.stop_ws_flag.clear() # İşareti temizle
+            logging.info("WebSocket bağlantısı durduruldu.")
+
+        # 2. Verileri ve durumu temizle
+        logging.info("Mevcut veriler temizleniyor...")
+        self.data.clear()
+        self.scores.clear()
+        self.ratios.clear()
+        self.signals.clear()
+        self.signal_history.clear()
+        self.active_signals_to_track.clear()
+        self.symbol_to_tree_item.clear()
+        self.ml_predictions.clear() # ML tahminlerini de temizle
+        self.initial_load_complete.clear() # Yükleme tamamlanmadı olarak işaretle
+        # GUI tablosunu temizle (ana thread üzerinden)
+        self.root.after(0, lambda: [self.tree_scanner.delete(i) for i in self.tree_scanner.get_children()])
+
+        # 3. Yeni zaman dilimi için başlangıç verilerini yükle
+        logging.info(f"{new_timeframe} için başlangıç verileri yükleniyor...")
+        initial_load_thread = threading.Thread(target=self.update_initial_data, args=(new_timeframe,), daemon=True)
+        initial_load_thread.start()
+        
+        logging.info("Başlangıç veri yükleme thread'i başlatıldı. Yükleme bitince WebSocket başlayacak.")
+
+    def export_signals_to_csv(self, filename: str = "signals_analysis_export.csv"):
+        """Sinyal ve sonuç verilerini CSV dosyasına aktarır."""
+        logging.info(f"Sinyal ve sonuç verileri '{filename}' dosyasına aktarılıyor...")
+        
+        export_data = self.get_trade_outcomes_for_export(limit=10000) # Daha fazla veri çekelim
+
+        if not export_data:
+            logging.warning("Aktarılacak sinyal/sonuç verisi bulunamadı.")
+            # GUI üzerinden çağrıldıysa kullanıcıyı bilgilendir
+            try:
+                from tkinter import messagebox
+                messagebox.showwarning("Export Failed", "No signal/outcome data found in the database to export.")
+            except ImportError:
+                 pass # GUI yoksa devam et
+            return
+
+        try:
+            # İlk kaydın anahtarlarını başlık olarak kullan (tüm sütunları içerir)
+            headers = list(export_data[0].keys())
+            
+            # Dosya yolunu proje dizini ile birleştir (isteğe bağlı)
+            # file_path = os.path.join(os.path.dirname(__file__), filename) # Script ile aynı dizine kaydet
+            file_path = filename # Veya direkt çalışma dizinine kaydet
+            
+            with open(file_path, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=headers)
+                writer.writeheader()
+                writer.writerows(export_data)
+                
+            logging.info(f"{len(export_data)} kayıt başarıyla '{file_path}' dosyasına aktarıldı.")
+            # Kullanıcıyı bilgilendir
+            try:
+                from tkinter import messagebox
+                messagebox.showinfo("Export Successful", f"{len(export_data)} records exported successfully to:\n{os.path.abspath(file_path)}")
+            except ImportError:
+                pass 
+        except IOError as e:
+            logging.error(f"CSV dosyası yazılırken hata oluştu: {e}")
+            try:
+                from tkinter import messagebox
+                messagebox.showerror("Export Error", f"Could not write to file {filename}.\n{e}")
+            except ImportError:
+                pass 
+        except Exception as e:
+            logging.error(f"CSV aktarma sırasında beklenmedik hata: {e}", exc_info=True)
+            try:
+                from tkinter import messagebox
+                messagebox.showerror("Export Error", f"An unexpected error occurred during export.\n{e}")
+            except ImportError:
+                pass
+
+    def get_trade_outcomes_for_export(self, limit: int = 5000) -> List[Dict[str, Any]]:
+        """Veritabanından sinyal ve sonuç verilerini CSV export için çeker."""
+        conn = self._connect_db()
+        if conn is None: return []
+        
+        # LEFT JOIN kullanarak tüm sinyalleri ve eşleşen sonuçları al
+        # outcomes tablosundaki sütun isimlerinin signals ile çakışmaması için alias kullanılabilir
+        # Şimdilik basit tutalım, sütun isimleri farklı varsayıyoruz (outcome_timestamp vs timestamp)
+        sql = ''' 
+        SELECT 
+            s.*, -- signals tablosundaki tüm sütunlar
+            o.outcome_timestamp,
+            o.achieved_price,
+            o.time_to_target_s
+        FROM signals s
+        LEFT JOIN outcomes o ON o.signal_id = s.id 
+        ORDER BY s.timestamp DESC -- En son sinyaller önce
+        LIMIT ?
+        '''
+        trades_data = []
+        try:
+            cursor = conn.cursor()
+            cursor.execute(sql, (limit,))
+            rows = cursor.fetchall()
+            # sqlite3.Row nesnelerini dict'e çevir
+            for row in rows:
+                trades_data.append(dict(row))
+            logging.info(f"{len(trades_data)} adet sinyal/sonuç verisi export için veritabanından çekildi (Limit: {limit}).")
+            return trades_data
+        except sqlite3.Error as e:
+            logging.error(f"SQLite export verisi çekme hatası: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def get_trade_outcomes(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Veritabanından tamamlanmış veya başarısız olmuş işlemlerin sonuçlarını çeker."""
+        conn = self._connect_db()
+        if conn is None: return []
+        sql = ''' 
+        SELECT 
+            s.timestamp as signal_timestamp,
+            s.symbol,
+            s.signal_type,
+            s.signal_price,
+            s.score,
+            s.ratio as signal_ratio, -- Sinyal anındaki ratio
+            s.is_confirmed_orig, -- Orijinal teyit durumu
+            s.volume_ok,
+            s.momentum_perc_ok,
+            s.momentum_abs_ok,
+            s.tracking_status, -- COMPLETED / FAILED
+            o.outcome_timestamp,
+            o.achieved_price, -- Hedef fiyat veya takip sonu fiyatı
+            o.max_high_price_after_signal,
+            o.max_percentage_gain,
+            o.time_to_target_s -- Süre (saniye)
+        FROM signals s
+        LEFT JOIN outcomes o ON o.signal_id = s.id 
+        WHERE s.tracking_status IN ('COMPLETED', 'FAILED')
+        ORDER BY o.outcome_timestamp DESC NULLS LAST, s.timestamp DESC 
+        LIMIT ?
+        '''
+        trades = []
+        try:
+            cursor = conn.cursor()
+            cursor.execute(sql, (limit,))
+            rows = cursor.fetchall()
+            for row in rows:
+                trades.append(dict(row))
+            logging.info(f"{len(trades)} adet işlem sonucu veritabanından çekildi (Limit: {limit}).")
+            return trades
+        except sqlite3.Error as e:
+            logging.error(f"SQLite işlem sonucu çekme hatası: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def refresh_trade_outcomes_tab(self):
+        """Trade Outcomes sekmesindeki tabloyu veritabanından günceller."""
+        # Önce mevcut verileri temizle
+        for item in self.tree_trades.get_children():
+            self.tree_trades.delete(item)
+            
+        # Veritabanından işlem sonuçlarını çek
+        trade_outcomes = self.get_trade_outcomes(limit=200) # Son 200 sonucu göster
+        
+        # Tabloyu doldur
+        for trade in trade_outcomes:
+            # Verileri formatla
+            signal_price_formatted = f"{trade.get('signal_price', 0.0):.5f}"
+            max_gain_formatted = f"{trade.get('max_percentage_gain', 0.0):.2f}" if trade.get('max_percentage_gain') is not None else '-'
+            max_high_formatted = f"{trade.get('max_high_price_after_signal', 0.0):.5f}" if trade.get('max_high_price_after_signal') is not None else '-'
+            duration_formatted = f"{trade.get('time_to_target_s', 0.0):.0f}" if trade.get('time_to_target_s') is not None else '-'
+            
+            values = (
+                trade.get('signal_timestamp', '-'),
+                trade.get('symbol', '-'),
+                trade.get('signal_type', '-'),
+                trade.get('tracking_status', '-'), # Status
+                signal_price_formatted,
+                max_gain_formatted, # Max % Gain
+                max_high_formatted, # Max High
+                trade.get('outcome_timestamp', '-'),
+                duration_formatted # Duration
+            )
+            self.tree_trades.insert('', 'end', values=values)
+        logging.info("Trade outcomes tablosu güncellendi.")
+
+    def prepare_ml_data(self) -> pd.DataFrame:
+        """Queries DB, prepares features and target for ML model."""
+        logging.info("Preparing data for ML model...")
+        conn = self._connect_db()
+        if conn is None: 
+            return pd.DataFrame() # Return empty DataFrame on DB error
+
+        # Query signals table for features
+        # Select features potentially useful for prediction
+        sql_signals = """
+        SELECT 
+            id, symbol, signal_type, score, ratio AS signal_ratio, 
+            signal_price, signal_volume, confirm_volume, 
+            signal_momentum_perc, confirm_momentum_perc,
+            signal_abs_price_change, confirm_abs_price_change,
+            volume_ok, momentum_perc_ok, momentum_abs_ok, 
+            is_confirmed_orig, tracking_status 
+        FROM signals
+        WHERE tracking_status IN ('COMPLETED', 'FAILED') -- Only use decided outcomes
+        ORDER BY timestamp DESC 
+        LIMIT 5000 -- Limit data size for initial training
+        """ 
+        try:
+            signals_df = pd.read_sql_query(sql_signals, conn)
+            logging.info(f"Fetched {len(signals_df)} signals with 'COMPLETED' or 'FAILED' status.")
+            
+            if signals_df.empty:
+                logging.warning("No completed or failed signals found in the database for ML training.")
+                return pd.DataFrame()
+
+            # Create the target variable 'success'
+            # 1 if COMPLETED, 0 if FAILED
+            signals_df['success'] = np.where(signals_df['tracking_status'] == 'COMPLETED', 1, 0)
+            
+            # --- Feature Engineering / Selection ---
+            # Select numerical features that were available *at the time of the signal*
+            features = [
+                'score', 'signal_ratio', 
+                'signal_volume', 'confirm_volume', 
+                'signal_momentum_perc', 'confirm_momentum_perc',
+                'signal_abs_price_change', 'confirm_abs_price_change',
+                'volume_ok', 'momentum_perc_ok', 'momentum_abs_ok', 
+                'is_confirmed_orig' 
+                # Add more features if available and relevant
+            ]
+            
+            # Ensure selected features exist
+            available_features = [f for f in features if f in signals_df.columns]
+            if not available_features:
+                 logging.error("No suitable features found in the signals data for ML.")
+                 return pd.DataFrame()
+                 
+            logging.info(f"Selected features for ML: {available_features}")
+
+            ml_df = signals_df[available_features + ['success']].copy()
+
+            # Basic Preprocessing within this function (can be moved to pipeline)
+            # Handle potential infinities first
+            ml_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+            
+            # Simple imputation for NaNs (using median) - consider more sophisticated methods
+            for col in available_features:
+                if ml_df[col].isnull().any():
+                    median_val = ml_df[col].median()
+                    ml_df[col].fillna(median_val, inplace=True)
+                    logging.debug(f"Imputed NaNs in '{col}' with median value {median_val}.")
+
+            logging.info(f"Prepared DataFrame for ML with {len(ml_df)} samples and {len(available_features)} features.")
+            return ml_df
+
+        except pd.io.sql.DatabaseError as db_err:
+            logging.error(f"Database error during ML data preparation: {db_err}")
+            return pd.DataFrame()
+        except Exception as e:
+            logging.error(f"Error preparing ML data: {e}", exc_info=True)
+            return pd.DataFrame()
+        finally:
+            if conn:
+                conn.close()
+
+    def train_and_evaluate_model(self):
+        """Trains a simple ML model and evaluates it."""
+        ml_data = self.prepare_ml_data()
+
+        if ml_data.empty:
+            logging.warning("ML Data preparation failed or returned empty data. Skipping training.")
+            self.update_ml_results_display("Failed to prepare data for training.")
+            return
+
+        features = [col for col in ml_data.columns if col != 'success']
+        X = ml_data[features]
+        y = ml_data['success']
+
+        if len(X) < 20: # Need sufficient data
+            logging.warning(f"Insufficient data ({len(X)} samples) for ML training. Need at least 20.")
+            self.update_ml_results_display(f"Insufficient data ({len(X)} samples) for training.")
+            return
+            
+        # Check if target variable has both classes
+        if len(y.unique()) < 2:
+            logging.warning(f"Target variable 'success' has only one class ({y.unique()}). Cannot train classifier.")
+            self.update_ml_results_display(f"Target variable 'success' has only one class ({y.unique()}). Training aborted.")
+            return
+
+        # Split data
+        try:
+             X_train, X_test, y_train, y_test = train_test_split(
+                 X, y, test_size=0.3, random_state=42, stratify=y # Stratify for imbalanced classes
+             )
+        except ValueError as e:
+             logging.error(f"Error during train_test_split (likely due to insufficient samples per class): {e}")
+             self.update_ml_results_display(f"Error splitting data (insufficient samples per class?):\n{e}")
+             return
+
+        logging.info(f"Training data: {X_train.shape}, Testing data: {X_test.shape}")
+
+        # Define Model Pipeline (Imputer + Scaler + Classifier)
+        # Using RandomForest as it's less sensitive to feature scaling, but scaling is good practice
+        self.ml_pipeline = Pipeline([
+            ('imputer', SimpleImputer(strategy='median')), # Redundant if pre-imputed, but safe
+            ('scaler', StandardScaler()), 
+            ('classifier', RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced')) # Handle imbalance
+            # ('classifier', LogisticRegression(random_state=42, class_weight='balanced')) # Alternative
+        ])
+
+        try:
+            # Train the model
+            logging.info("Training ML model pipeline...")
+            self.ml_pipeline.fit(X_train, y_train)
+            logging.info("ML model training complete.")
+            
+            # Store the trained pipeline
+            self.ml_model = self.ml_pipeline 
+            
+            # Evaluate the model
+            logging.info("Evaluating ML model...")
+            y_pred = self.ml_pipeline.predict(X_test)
+            
+            accuracy = accuracy_score(y_test, y_pred)
+            report = classification_report(y_test, y_pred)
+            matrix = confusion_matrix(y_test, y_pred)
+
+            results_text = f"--- ML Model Evaluation ---\n"
+            results_text += f"Model: {self.ml_pipeline.steps[-1][0]} ({type(self.ml_pipeline.steps[-1][1]).__name__})\n"
+            results_text += f"Features: {features}\n"
+            results_text += f"Training Samples: {len(X_train)}, Testing Samples: {len(X_test)}\n\n"
+            results_text += f"Accuracy: {accuracy:.4f}\n\n"
+            results_text += "Confusion Matrix:\n"
+            results_text += f"{matrix}\n\n"
+            results_text += "Classification Report:\n"
+            results_text += f"{report}\n"
+            
+            # --- Feature Importance (Eklendi) ---
+            if hasattr(self.ml_pipeline.steps[-1][1], 'feature_importances_'):
+                importances = self.ml_pipeline.steps[-1][1].feature_importances_
+                feature_names = X_train.columns # Özellik isimlerini alalım
+                feature_importance_df = pd.DataFrame({'feature': feature_names, 'importance': importances})
+                feature_importance_df = feature_importance_df.sort_values('importance', ascending=False)
+                
+                results_text += "\nFeature Importances:\n"
+                results_text += feature_importance_df.to_string(index=False) + "\n"
+                logging.info("Feature Importances calculated.")
+            else:
+                logging.warning("Could not retrieve feature importances from the model.")
+            # --- /Feature Importance ---
+
+            logging.info(f"Model Evaluation Results:\n{results_text}")
+            
+            # Display results in GUI
+            self.update_ml_results_display(results_text)
+
+        except Exception as e:
+            logging.error(f"Error during ML model training or evaluation: {e}", exc_info=True)
+            self.update_ml_results_display(f"Error during training/evaluation:\n{e}")
+            self.ml_model = None # Ensure model is not stored if training failed
+            
+    def update_ml_results_display(self, text: str):
+        """Updates the ML results text widget in the GUI."""
+        # Ensure this runs in the main GUI thread
+        def _update():
+            if hasattr(self, 'ml_results_text_widget') and self.ml_results_text_widget.winfo_exists():
+                self.ml_results_text_widget.config(state=tk.NORMAL) # Enable writing
+                self.ml_results_text_widget.delete(1.0, tk.END) # Clear previous content
+                self.ml_results_text_widget.insert(tk.END, text)
+                self.ml_results_text_widget.config(state=tk.DISABLED) # Disable writing
+            else:
+                logging.warning("ML results text widget not available or destroyed.")
+        
+        if self.root and self.root.winfo_exists():
+             self.root.after(0, _update)
+
+
+if __name__ == "__main__":
+    logging.info("------ Program Başlatılıyor (__main__). ------") # LOG EKLE
+    # API anahtarlarını buraya ekleyin veya güvenli bir yerden okuyun
+    API_KEY = "***************"
+    API_SECRET = "**************"
+
+    # --- API Anahtarı Kontrolü ---
+    if API_KEY == "YOUR_API_KEY" or API_SECRET == "YOUR_API_SECRET":
+        logging.error("Lütfen API anahtarlarınızı `crypto_scanner.py` dosyasının sonunda belirtin.")
+        # exit() # Programı burada sonlandırabiliriz
+    else:
+        logging.info("API anahtarları yüklendi.")
+    # ---------------------------
+
+    logging.info("------ CryptoScanner nesnesi oluşturuluyor... ------") # LOG EKLE
+    scanner = CryptoScanner(API_KEY, API_SECRET)
+    logging.info("------ CryptoScanner nesnesi oluşturuldu. ------") # LOG EKLE
+
+    # --- Başarılı İşlemleri Yazdırma (İsteğe Bağlı) ---
+    # Bu artık run içinde çalışmayacak, program başlamadan önce kontrol edilebilir.
+    try:
+        basarili_islemler = scanner.get_successful_trades(limit=10)
+        if basarili_islemler:
+            print("\\n--- Başarılı İşlemler (Veritabanından) ---")
+            for islem in basarili_islemler:
+                print(f"  Sinyal Zamanı: {islem['signal_timestamp']}, Sembol: {islem['symbol']}, Tip: {islem['signal_type']}, "
+                      f"Süre(s): {islem['time_to_target_s']:.0f}, Sinyal Fiyatı: {islem['signal_price']:.5f}")
+            print("----------------------------------------\\n")
+        else:
+            print("\\nVeritabanında başarılı işlem bulunamadı.\\n")
+    except Exception as e:
+        print(f"Başarılı işlemler okunurken hata: {e}")
+    # ---------------------------------------------------
+
+    logging.info("------ scanner.run() çağrılıyor... ------") # LOG EKLE
+    scanner.run() 
